@@ -7,8 +7,12 @@
 //! caller-provided storage (a slice of `T`).
 const std = @import("std");
 
+/// What a coroutine's `step` returns.
+/// * `.yield` — not finished; the scheduler will call `step` again later.
+/// * `.done`  — finished; `step` is never called on this task again.
 pub const Step = enum { yield, done };
 
+/// Returned by `runAll` / `runParallel` when the cancel flag was observed.
 pub const Error = error{Canceled};
 
 fn checkTask(comptime T: type) void {
@@ -16,6 +20,28 @@ fn checkTask(comptime T: type) void {
 }
 
 /// Runs every task round-robin until all are done, on the calling thread.
+///
+/// Params:
+/// * `T` — coroutine type with `pub fn step(self: *T) Step`.
+/// * `tasks` — caller-owned storage; nothing is allocated.
+/// * `cancel` — optional flag; `null` = run to completion.
+///
+/// Returns the total number of `step` calls, or `error.Canceled`.
+///
+/// Note: the slice is **permuted in place** (finished tasks are swapped to the
+/// end), so identify tasks by a field, not by their index.
+///
+/// ```zig
+/// const Countdown = struct {
+///     left: u32,
+///     pub fn step(c: *Countdown) Step {
+///         c.left -= 1;
+///         return if (c.left == 0) .done else .yield;
+///     }
+/// };
+/// var tasks: [3]Countdown = .{ .{ .left = 1 }, .{ .left = 2 }, .{ .left = 3 } };
+/// const steps = try runAll(Countdown, &tasks, null); // steps == 6
+/// ```
 /// Finished tasks are moved to the end of `tasks` (the slice is permuted in
 /// place, so tasks must not rely on their index). Returns the number of
 /// `step` calls made. If `cancel` is set and becomes true, stops after the
@@ -39,6 +65,7 @@ pub fn runAll(comptime T: type, tasks: []T, cancel: ?*const std.atomic.Value(boo
     return steps;
 }
 
+/// Options for `runParallel`. All fields have defaults: `.{}` is valid.
 pub const ParallelOptions = struct {
     /// Total worker count including the calling thread. 0 = CPU count.
     threads: usize = 0,
@@ -55,7 +82,17 @@ pub const worker_stack_size = 1024 * 1024;
 /// Hard cap on worker threads; their handles live on the caller's stack.
 pub const max_threads = 64;
 
-/// Runs tasks on up to `opts.threads` OS threads. Work distribution is a
+/// Runs tasks on up to `opts.threads` OS threads (including the caller's).
+///
+/// Params: `T` and `tasks` as in `runAll`; `opts` see `ParallelOptions`.
+/// Returns when every task is done (or `error.Canceled`); all threads have
+/// been joined by then. Each task is stepped by exactly one thread, so a
+/// task's own fields need no synchronisation; shared state does.
+///
+/// ```zig
+/// try runParallel(Countdown, tasks, .{ .threads = 4, .chunk = 64 });
+/// ```
+/// Work distribution is a
 /// lock-free queue: one atomic cursor over `tasks`; each worker claims a
 /// chunk with `fetchAdd` and runs it round-robin to completion, then claims
 /// the next. The calling thread works too. All spawned threads are joined

@@ -48,10 +48,6 @@ const SmTask = struct {
     }
 };
 
-fn hybridTask(_: void, i: usize) u64 {
-    return taskSequential(i);
-}
-
 fn ioTask(out: *std.atomic.Value(u64), id: usize) Io.Cancelable!void {
     _ = out.fetchAdd(taskSequential(id), .monotonic);
 }
@@ -291,16 +287,6 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         r.children = usage(true);
         r.children.maxrss_kb = rss_sum;
-    } else if (std.mem.eql(u8, name, "hybrid")) {
-        var threaded: Io.Threaded = .init(ca, .{});
-        defer threaded.deinit();
-        const t0 = now(io);
-        const hr = try coro.hybrid.run(threaded.io(), init.gpa, n_tasks, {}, hybridTask, .{});
-        r.ns = now(io) - t0;
-        r.check = hr.sum;
-        r.threads = @intFromEnum(hr.mode); // 0 = processes, 1 = io
-        r.children = usage(true);
-        r.children.maxrss_kb = hr.children_peak_rss_bytes / 1024;
     } else {
         return error.UnknownVariant;
     }
@@ -365,7 +351,6 @@ pub fn main(init: std.process.Init) !void {
     const w = &fw.interface;
     defer w.flush() catch {};
 
-    if (try coro.hybrid.workerMain(io, args, {}, hybridTask)) return;
     if (args.len >= 4 and std.mem.eql(u8, args[1], "worker")) {
         const a = try std.fmt.parseInt(u64, args[2], 10);
         const b = try std.fmt.parseInt(u64, args[3], 10);
@@ -398,12 +383,12 @@ pub fn main(init: std.process.Init) !void {
         try w.print("\n", .{});
     }
 
-    if (std.mem.eql(u8, which, "all") or std.mem.eql(u8, which, "hybrid")) {
+    if (std.mem.eql(u8, which, "all") or std.mem.eql(u8, which, "bytasks")) {
         const hreps = 3;
         const cpus = cpuCount();
-        try w.print("## Four backends by task count N\n\n", .{});
-        try w.print("Median of {d} runs, each a fresh process. processes = min(N, {d} CPUs) worker processes. hybrid = processes while N <= {d}, Io coroutines above. RSS = parent + sum of children peak RSS. CPU % = (user + sys CPU time of the variant and its children, from getrusage) / wall time of the same interval (incl. setup such as thread pool and allocation); 100% = one core busy. wall ms = timed region only.\n\n", .{ hreps, cpus, coro.hybrid.default_threshold });
-        try w.writeAll("| variant | N | wall ms | RSS MB | CPU % | hybrid mode |\n|---|---:|---:|---:|---:|---|\n");
+        try w.print("## Three backends by task count N\n\n", .{});
+        try w.print("Median of {d} runs, each a fresh process. processes = min(N, {d} CPUs) worker processes. RSS = parent + sum of children peak RSS. CPU % = (user + sys CPU time of the variant and its children, from getrusage) / wall time of the same interval (incl. setup such as thread pool and allocation); 100% = one core busy. wall ms = timed region only.\n\n", .{ hreps, cpus });
+        try w.writeAll("| variant | N | wall ms | RSS MB | CPU % |\n|---|---:|---:|---:|---:|\n");
         for ([_]usize{ 16, 64, 255, 256, 257, 1024, 10_000 }) |n| {
             var tb: [24]u8 = undefined;
             const targ = try std.fmt.bufPrint(&tb, "t={d}", .{n});
@@ -413,17 +398,14 @@ pub fn main(init: std.process.Init) !void {
                 .{ .label = "state machine", .args = &.{ "sm-parallel", targ } },
                 .{ .label = "Io", .args = &.{ "io-group", targ } },
                 .{ .label = "processes", .args = &.{ "procs", targ, parg } },
-                .{ .label = "hybrid", .args = &.{ "hybrid", targ } },
             };
             for (rows) |rw| {
                 const r = try measure(init, exe, rw.args, hreps);
                 const wall_ns: f64 = @floatFromInt(r.ns);
                 const all_ns: f64 = @floatFromInt(r.wall_all_ns);
                 const cpu_ns: f64 = @floatFromInt((r.self.cpu_us + r.children.cpu_us) * 1000);
-                const is_h = std.mem.eql(u8, rw.label, "hybrid");
-                const mode: []const u8 = if (!is_h) "" else if (r.threads == 1) "**Io (switched)**" else "processes";
-                try w.print("| {s} | {d} | {d:.2} | {d:.1} | {d:.0} | {s} |\n", .{
-                    rw.label, n, wall_ns / 1e6, mb(r.self.maxrss_kb + r.children.maxrss_kb), 100 * cpu_ns / all_ns, mode,
+                try w.print("| {s} | {d} | {d:.2} | {d:.1} | {d:.0} |\n", .{
+                    rw.label, n, wall_ns / 1e6, mb(r.self.maxrss_kb + r.children.maxrss_kb), 100 * cpu_ns / all_ns,
                 });
             }
             try w.flush();

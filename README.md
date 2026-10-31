@@ -1,44 +1,64 @@
 # coroutines
 
-Two coroutine flavours plus a hybrid backend for Zig 0.17.0, standard library only (no third-party dependencies).
+Two coroutine flavours for Zig 0.17.0, standard library only (no third-party dependencies).
 
 | module | what a coroutine is | switch | memory per task | parallelism |
 |---|---|---|---|---|
 | `coroutines.state_machine` | a struct with a state field and `pub fn step(*T) Step` (`.yield` / `.done`) | a function return + call | `@sizeOf(T)`, caller-provided storage, 0 allocations | `runParallel`: N OS threads, lock-free chunked work queue |
 | `coroutines.io` | a function run through `std.Io` (`Io.Group`, `Io.Queue`) | whatever the `Io` does (thread handoff for `std.Io.Threaded`) | one allocation per task in `std.Io.Threaded` (64 B measured) | the `Io` thread pool |
-| `coroutines.hybrid` | `task(ctx, i) u64`, results summed | processes while `n <= threshold` (default 256), `Io` coroutines above | as processes / as `io` | worker processes (one per CPU) or the `Io` thread pool |
 
-## Usage
+## Using in your project
 
-```zig
-const coro = @import("coroutines");
+Requires Zig 0.17.0. No dependencies besides the standard library.
 
-// 1. State machine
-const Task = struct {
-    left: u32,
-    pub fn step(t: *Task) coro.state_machine.Step {
-        t.left -= 1;
-        return if (t.left == 0) .done else .yield;
-    }
-};
-var tasks: [1000]Task = @splat(.{ .left = 10 });
-_ = try coro.state_machine.runAll(Task, &tasks, null);           // one thread
-try coro.state_machine.runParallel(Task, &tasks, .{ .threads = 4 }); // N threads
+1. Add the package:
 
-// 2. std.Io
-var group: std.Io.Group = .init;
-coro.io.spawnEach(io, &group, 10_000, myTask, ctx); // myTask(ctx, i) Io.Cancelable!void
-try group.await(io); // or group.cancel(io)
+   ```sh
+   zig fetch --save git+https://github.com/pyrlyn/coroutines
+   ```
 
-var buf: [64]Msg = undefined;
-var d: coro.io.Dispatcher(Msg, *Ctx, handler) = .init(io, ctx, &buf);
-try d.start(4);       // 4 worker coroutines reading a bounded Io.Queue
-try d.submit(msg);
-try d.shutdown();     // close queue, drain, join  (d.cancel() for a hard stop)
-```
+   (the repository is private: the machine running `zig fetch` needs git access to it;
+   pin a commit with `git+https://github.com/pyrlyn/coroutines#<commit>`).
 
-Add to a project: `zig fetch --save git+https://github.com/pyrlyn/coroutines` and
-`exe.root_module.addImport("coroutines", b.dependency("coroutines", .{}).module("coroutines"))`.
+2. Import the module in `build.zig`:
+
+   ```zig
+   const coroutines = b.dependency("coroutines", .{ .target = target, .optimize = optimize });
+   exe.root_module.addImport("coroutines", coroutines.module("coroutines"));
+   ```
+
+3. Use it:
+
+   ```zig
+   const std = @import("std");
+   const coro = @import("coroutines");
+
+   const Countdown = struct {
+       left: u32,
+       pub fn step(c: *Countdown) coro.state_machine.Step {
+           c.left -= 1;
+           return if (c.left == 0) .done else .yield;
+       }
+   };
+
+   fn work(sum: *std.atomic.Value(u64), i: usize) std.Io.Cancelable!void {
+       _ = sum.fetchAdd(i, .monotonic);
+   }
+
+   pub fn main(init: std.process.Init) !void {
+       // State machine: 1000 tasks on all cores, no allocation.
+       var tasks: [1000]Countdown = @splat(.{ .left = 10 });
+       try coro.state_machine.runParallel(Countdown, &tasks, .{});
+
+       // std.Io: 10,000 tasks in a group.
+       var sum: std.atomic.Value(u64) = .init(0);
+       var group: std.Io.Group = .init;
+       coro.io.spawnEach(init.io, &group, 10_000, work, &sum);
+       try group.await(init.io);
+   }
+   ```
+
+Full reference: [docs/API.md](docs/API.md).
 
 ## Design
 
@@ -57,17 +77,6 @@ Add to a project: `zig fetch --save git+https://github.com/pyrlyn/coroutines` an
   the run returns `error.Canceled` after all workers have stopped.
 * Limitation: a task that never yields blocks its worker; there is no preemption.
 
-### `hybrid`
-
-* `hybrid.run(io, gpa, n, ctx, task, .{ .threshold = 256, .processes = 0 })` runs
-  `task(ctx, i)` for `i` in `0..n` and returns `.{ .sum, .mode, .children_peak_rss_bytes }`.
-* `n <= threshold` → `.processes`: the current binary is re-executed `min(n, processes or CPU count)`
-  times with `--coroutines-hybrid-worker lo hi`; each child prints its partial sum. Programs
-  using it must call `hybrid.workerMain(io, args, ctx, task)` first thing in `main`.
-* `n > threshold` → `.io`: one `Io.Group` task per index (same as `io.spawnEach`).
-* Default 256 = the process count from which `io-group` beat processes on wall time on macOS
-  in the sweep below. `hybrid.chooseMode(n, threshold)` is the pure decision function.
-
 ### `io`
 
 * Built only on the `std.Io` interface, so the same code runs on `std.Io.Threaded`
@@ -83,16 +92,13 @@ Add to a project: `zig fetch --save git+https://github.com/pyrlyn/coroutines` an
 
 ## Tests
 
-`zig build test` — 11 unit tests plus the `hybrid-e2e` executable:
+`zig build test` — 9 unit tests:
 
 * state machine: 10k tasks round-robin with exact step count and results; 10k tasks on
   4 threads with ≥ 2 distinct threads observed; cancellation joins all workers.
 * io: 10k tasks in an `Io.Group` with ≥ 2 distinct threads; a `Dispatcher` with 4 workers
   processing 10k messages and shutting down cleanly; `Group.cancel` stopping endless
   sleeping tasks; `Dispatcher.cancel` with blocked workers.
-* hybrid: `chooseMode` below / exactly at / above the threshold; Io mode result. `tests/hybrid_main.zig`
-  runs the real processes mode end to end for n = 0, 1, 255, 256 (processes), 257, 10,000 (Io),
-  custom thresholds 99/100, and checks both modes return the identical sum for the same n.
 
 ## Benchmarks
 
@@ -205,61 +211,46 @@ faults (no `getrusage`). macOS reports almost every switch as involuntary and Li
 voluntary, so compare context-switch counts within one OS only. The Linux VM ran with 4 vCPUs,
 so its parallel numbers are not comparable 1:1 with the 16-CPU macOS numbers.
 
-## Hybrid backend
+## Backends by task count
 
-macOS only (Apple M3 Max, 16 CPUs), `SUITES=hybrid bench/run.sh` →
+macOS only (Apple M3 Max, 16 CPUs), `SUITES=bytasks bench/run.sh` →
 [`bench/results/hybrid-darwin-arm64.md`](bench/results/hybrid-darwin-arm64.md). Same task as above
 (~1k xorshift rounds); N = number of tasks. processes = min(N, 16) worker processes.
-**Bold** = the hybrid switched to Io (N > 256). CPU % = (user + sys CPU time of the variant
-and its children) / wall time of the same interval; 100% = one core busy.
+CPU % = (user + sys CPU time of the variant and its children) / wall time of the same interval;
+100% = one core busy.
 
-| variant | N | wall ms | RSS MB | CPU % | hybrid mode |
-|---|---:|---:|---:|---:|---|
-| variant | N | wall ms | RSS MB | CPU % | hybrid mode |
-| state machine | 16 | 0.14 | 2.2 | 244 |  |
-| Io | 16 | 0.18 | 2.7 | 335 |  |
-| processes | 16 | 5.85 | 33.8 | 640 |  |
-| hybrid | 16 | 5.56 | 33.1 | 643 | processes |
-| state machine | 64 | 0.17 | 2.2 | 263 |  |
-| Io | 64 | 0.34 | 2.4 | 304 |  |
-| processes | 64 | 5.81 | 33.8 | 623 |  |
-| hybrid | 64 | 5.43 | 33.1 | 645 | processes |
-| state machine | 255 | 0.48 | 2.2 | 164 |  |
-| Io | 255 | 1.08 | 2.8 | 363 |  |
-| processes | 255 | 5.59 | 33.8 | 664 |  |
-| hybrid | 255 | 5.50 | 33.1 | 624 | processes |
-| state machine | 256 | 0.48 | 2.2 | 156 |  |
-| Io | 256 | 1.05 | 2.7 | 351 |  |
-| processes | 256 | 5.81 | 33.9 | 595 |  |
-| hybrid | 256 | 5.54 | 33.1 | 616 | processes |
-| state machine | 257 | 0.46 | 2.2 | 156 |  |
-| Io | 257 | 1.12 | 2.6 | 327 |  |
-| processes | 257 | 6.16 | 33.8 | 593 |  |
-| hybrid | 257 | 0.96 | 2.7 | 342 | **Io (switched)** |
-| state machine | 1024 | 0.50 | 2.3 | 405 |  |
-| Io | 1024 | 3.67 | 2.7 | 328 |  |
-| processes | 1024 | 6.04 | 33.8 | 618 |  |
-| hybrid | 1024 | 3.98 | 2.7 | 319 | **Io (switched)** |
-| state machine | 10000 | 1.85 | 2.5 | 1034 |  |
-| Io | 10000 | 37.63 | 2.8 | 323 |  |
-| processes | 10000 | 7.63 | 33.8 | 739 |  |
-| hybrid | 10000 | 32.73 | 2.9 | 321 | **Io (switched)** |
+| variant | N | wall ms | RSS MB | CPU % |
+|---|---:|---:|---:|---:|
+| state machine | 16 | 0.14 | 2.2 | 244 |
+| Io | 16 | 0.18 | 2.7 | 335 |
+| processes | 16 | 5.85 | 33.8 | 640 |
+| state machine | 64 | 0.17 | 2.2 | 263 |
+| Io | 64 | 0.34 | 2.4 | 304 |
+| processes | 64 | 5.81 | 33.8 | 623 |
+| state machine | 255 | 0.48 | 2.2 | 164 |
+| Io | 255 | 1.08 | 2.8 | 363 |
+| processes | 255 | 5.59 | 33.8 | 664 |
+| state machine | 256 | 0.48 | 2.2 | 156 |
+| Io | 256 | 1.05 | 2.7 | 351 |
+| processes | 256 | 5.81 | 33.9 | 595 |
+| state machine | 257 | 0.46 | 2.2 | 156 |
+| Io | 257 | 1.12 | 2.6 | 327 |
+| processes | 257 | 6.16 | 33.8 | 593 |
+| state machine | 1024 | 0.50 | 2.3 | 405 |
+| Io | 1024 | 3.67 | 2.7 | 328 |
+| processes | 1024 | 6.04 | 33.8 | 618 |
+| state machine | 10000 | 1.85 | 2.5 | 1034 |
+| Io | 10000 | 37.63 | 2.8 | 323 |
+| processes | 10000 | 7.63 | 33.8 | 739 |
 
 Measured:
 
-* The switch works as configured: at N = 255 and 256 the hybrid ran processes (≈ 5.5 ms,
-  33.1 MB — the same as the processes variant); at N = 257 it ran Io (0.96 ms, 2.7 MB — the same
-  as the Io variant). Above the threshold it tracks Io, below it tracks processes.
-* By task count, Io beat processes on wall time at every N up to 1024 (0.18 vs 5.85 ms at N = 16,
-  3.67 vs 6.04 ms at N = 1024) and lost at N = 10,000 (37.6 vs 7.6 ms). The processes variant
-  costs ≈ 5–6 ms of fixed spawn overhead and ≈ 34 MB for 16 children; Io stays at ≈ 2.7 MB.
-  So with this workload a threshold defined on task count would sit *below* 16 for time and
-  processes would win again somewhere between 1,024 and 10,000 tasks — the default 256 came from
-  the process-count sweep, where the axis was the number of processes, not tasks. The threshold
-  is a parameter; pick it from this table for your task size.
+* Io beat processes on wall time at every N up to 1024 (0.18 vs 5.85 ms at N = 16, 3.67 vs
+  6.04 ms at N = 1024) and lost at N = 10,000 (37.6 vs 7.6 ms). The processes variant costs
+  ≈ 5–6 ms of fixed spawn overhead and ≈ 34 MB for 16 children; Io stays at ≈ 2.7 MB.
 * The state machine was fastest and smallest at every N (0.14–1.85 ms, 2.2–2.5 MB).
 * CPU %: processes use 6–7 cores (593–739%); Io ≈ 3–3.6 cores (304–363%); the state machine
-  1.6–4 cores up to N = 1024 and 10 cores at 10,000 (most of its short runs is thread start-up).
+  1.6–4 cores up to N = 1024 and 10 cores at 10,000.
   *Hypothesis:* Io's ~3.3 cores reflect the thread hand-off cost seen in the switch benchmark.
 
 ## License

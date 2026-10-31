@@ -23,7 +23,7 @@ fi
 export MEM_AVAILABLE_MB=$avail
 # 1024 worker processes need > 1024 pipe fds
 ulimit -n 4096 2>/dev/null || true
-for suite in ${SUITES:-switch spawn procs sweep}; do
+for suite in ${SUITES:-switch spawn procs sweep bytasks}; do
   out=bench/results/$suite-$label.md
   {
     echo "# Benchmark: $suite ($label)"
