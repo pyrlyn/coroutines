@@ -48,6 +48,10 @@ const SmTask = struct {
     }
 };
 
+fn hybridTask(_: void, i: usize) u64 {
+    return taskSequential(i);
+}
+
 fn ioTask(out: *std.atomic.Value(u64), id: usize) Io.Cancelable!void {
     _ = out.fetchAdd(taskSequential(id), .monotonic);
 }
@@ -90,6 +94,7 @@ const Usage = struct {
     majflt: u64 = 0,
     nvcsw: u64 = 0,
     nivcsw: u64 = 0,
+    cpu_us: u64 = 0, // user + sys
 };
 
 const PROCESS_MEMORY_COUNTERS = extern struct {
@@ -125,6 +130,8 @@ fn usage(children: bool) Usage {
         .majflt = @intCast(ru.majflt),
         .nvcsw = @intCast(ru.nvcsw),
         .nivcsw = @intCast(ru.nivcsw),
+        .cpu_us = @as(u64, @intCast(ru.utime.sec)) * 1_000_000 + @as(u64, @intCast(ru.utime.usec)) +
+            @as(u64, @intCast(ru.stime.sec)) * 1_000_000 + @as(u64, @intCast(ru.stime.usec)),
     };
 }
 
@@ -138,6 +145,8 @@ const Result = struct {
     name: []const u8,
     ops: u64,
     ns: i96,
+    /// wall time of the whole variant incl. setup/teardown (same interval as cpu)
+    wall_all_ns: i96 = 0,
     allocs: u64 = 0,
     alloc_bytes: u64 = 0,
     threads: usize = 1,
@@ -148,7 +157,7 @@ const Result = struct {
     children: Usage = .{},
 };
 
-const n_tasks = 10_000;
+var n_tasks: usize = 10_000;
 const switch_steps = 10_000_000;
 const handoffs = 200_000;
 
@@ -177,6 +186,13 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
     var counting: Counting = .{ .child = std.heap.page_allocator };
     const ca = counting.allocator();
     var out: std.atomic.Value(u64) = .init(0);
+    const all0 = now(io);
+    const cpu0 = usage(false).cpu_us;
+    var extra_args = extra;
+    if (extra_args.len > 0 and std.mem.startsWith(u8, extra_args[0], "t=")) {
+        n_tasks = try std.fmt.parseInt(usize, extra_args[0][2..], 10);
+        extra_args = extra_args[1..];
+    }
     var r: Result = .{ .name = name, .ops = n_tasks, .ns = 0 };
 
     if (std.mem.eql(u8, name, "sm-switch")) {
@@ -243,7 +259,7 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
     } else if (std.mem.eql(u8, name, "procs2") or std.mem.eql(u8, name, "procs")) {
         // N OS processes (this binary in worker mode) splitting the tasks.
         // Each child's peak RSS comes from its own wait4() rusage and is summed.
-        const n: usize = if (name.len == 6) 2 else if (extra.len > 0) try std.fmt.parseInt(usize, extra[0], 10) else 2;
+        const n: usize = if (name.len == 6) 2 else if (extra_args.len > 0) try std.fmt.parseInt(usize, extra_args[0], 10) else 2;
         const exe = try std.process.executablePathAlloc(io, init.gpa);
         defer init.gpa.free(exe);
         const kids = try init.gpa.alloc(std.process.Child, n);
@@ -275,6 +291,16 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         r.children = usage(true);
         r.children.maxrss_kb = rss_sum;
+    } else if (std.mem.eql(u8, name, "hybrid")) {
+        var threaded: Io.Threaded = .init(ca, .{});
+        defer threaded.deinit();
+        const t0 = now(io);
+        const hr = try coro.hybrid.run(threaded.io(), init.gpa, n_tasks, {}, hybridTask, .{});
+        r.ns = now(io) - t0;
+        r.check = hr.sum;
+        r.threads = @intFromEnum(hr.mode); // 0 = processes, 1 = io
+        r.children = usage(true);
+        r.children.maxrss_kb = hr.children_peak_rss_bytes / 1024;
     } else {
         return error.UnknownVariant;
     }
@@ -283,15 +309,17 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.alloc_bytes = counting.bytes.load(.monotonic);
     } else r.alloc_bytes = counting.bytes.load(.monotonic);
     r.self = usage(false);
+    r.self.cpu_us -= cpu0; // CPU spent inside this function only
+    r.wall_all_ns = now(io) - all0;
     return r;
 }
 
 fn emit(w: *Io.Writer, r: Result) !void {
-    try w.print("{s} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
+    try w.print("{s} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
         r.name,             r.ops,            r.ns,             r.allocs,         r.alloc_bytes,
         r.threads,          r.procs,          r.spawn_ns,       r.check,          r.self.maxrss_kb,
         r.self.minflt,      r.self.majflt,    r.self.nvcsw,     r.self.nivcsw,    r.children.maxrss_kb,
-        r.children.minflt,  r.children.nvcsw, r.children.nivcsw,
+        r.children.minflt,  r.children.nvcsw, r.children.nivcsw,  r.self.cpu_us,     r.children.cpu_us, r.wall_all_ns,
     });
 }
 
@@ -299,7 +327,7 @@ fn parse(line: []const u8, name_buf: []u8) !Result {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     const name = it.next() orelse return error.Bad;
     @memcpy(name_buf[0..name.len], name);
-    var v: [17]i128 = undefined;
+    var v: [20]i128 = undefined;
     for (&v) |*x| x.* = try std.fmt.parseInt(i128, it.next() orelse return error.Bad, 10);
     const u = struct {
         fn f(x: i128) u64 {
@@ -308,9 +336,9 @@ fn parse(line: []const u8, name_buf: []u8) !Result {
     }.f;
     return .{
         .name = name_buf[0..name.len], .ops = u(v[0]), .ns = @intCast(v[1]), .allocs = u(v[2]), .alloc_bytes = u(v[3]),
-        .threads = @intCast(v[4]), .procs = @intCast(v[5]), .spawn_ns = @intCast(v[6]), .check = u(v[7]),
-        .self = .{ .maxrss_kb = u(v[8]), .minflt = u(v[9]), .majflt = u(v[10]), .nvcsw = u(v[11]), .nivcsw = u(v[12]) },
-        .children = .{ .maxrss_kb = u(v[13]), .minflt = u(v[14]), .nvcsw = u(v[15]), .nivcsw = u(v[16]) },
+        .wall_all_ns = @intCast(v[19]), .threads = @intCast(v[4]), .procs = @intCast(v[5]), .spawn_ns = @intCast(v[6]), .check = u(v[7]),
+        .self = .{ .maxrss_kb = u(v[8]), .minflt = u(v[9]), .majflt = u(v[10]), .nvcsw = u(v[11]), .nivcsw = u(v[12]), .cpu_us = u(v[17]) },
+        .children = .{ .maxrss_kb = u(v[13]), .minflt = u(v[14]), .nvcsw = u(v[15]), .nivcsw = u(v[16]), .cpu_us = u(v[18]) },
     };
 }
 
@@ -337,6 +365,7 @@ pub fn main(init: std.process.Init) !void {
     const w = &fw.interface;
     defer w.flush() catch {};
 
+    if (try coro.hybrid.workerMain(io, args, {}, hybridTask)) return;
     if (args.len >= 4 and std.mem.eql(u8, args[1], "worker")) {
         const a = try std.fmt.parseInt(u64, args[2], 10);
         const b = try std.fmt.parseInt(u64, args[3], 10);
@@ -366,6 +395,39 @@ pub fn main(init: std.process.Init) !void {
         try w.print("Median of {d} runs; each run is a fresh process. RSS = peak resident set of that process.\n\n", .{reps});
         try w.writeAll(header);
         for (s.variants) |v| try row(w, try measure(init, exe, &.{v}, reps));
+        try w.print("\n", .{});
+    }
+
+    if (std.mem.eql(u8, which, "all") or std.mem.eql(u8, which, "hybrid")) {
+        const hreps = 3;
+        const cpus = cpuCount();
+        try w.print("## Four backends by task count N\n\n", .{});
+        try w.print("Median of {d} runs, each a fresh process. processes = min(N, {d} CPUs) worker processes. hybrid = processes while N <= {d}, Io coroutines above. RSS = parent + sum of children peak RSS. CPU % = (user + sys CPU time of the variant and its children, from getrusage) / wall time of the same interval (incl. setup such as thread pool and allocation); 100% = one core busy. wall ms = timed region only.\n\n", .{ hreps, cpus, coro.hybrid.default_threshold });
+        try w.writeAll("| variant | N | wall ms | RSS MB | CPU % | hybrid mode |\n|---|---:|---:|---:|---:|---|\n");
+        for ([_]usize{ 16, 64, 255, 256, 257, 1024, 10_000 }) |n| {
+            var tb: [24]u8 = undefined;
+            const targ = try std.fmt.bufPrint(&tb, "t={d}", .{n});
+            var pb: [24]u8 = undefined;
+            const parg = try std.fmt.bufPrint(&pb, "{d}", .{@min(n, cpus)});
+            const rows = [_]struct { label: []const u8, args: []const []const u8 }{
+                .{ .label = "state machine", .args = &.{ "sm-parallel", targ } },
+                .{ .label = "Io", .args = &.{ "io-group", targ } },
+                .{ .label = "processes", .args = &.{ "procs", targ, parg } },
+                .{ .label = "hybrid", .args = &.{ "hybrid", targ } },
+            };
+            for (rows) |rw| {
+                const r = try measure(init, exe, rw.args, hreps);
+                const wall_ns: f64 = @floatFromInt(r.ns);
+                const all_ns: f64 = @floatFromInt(r.wall_all_ns);
+                const cpu_ns: f64 = @floatFromInt((r.self.cpu_us + r.children.cpu_us) * 1000);
+                const is_h = std.mem.eql(u8, rw.label, "hybrid");
+                const mode: []const u8 = if (!is_h) "" else if (r.threads == 1) "**Io (switched)**" else "processes";
+                try w.print("| {s} | {d} | {d:.2} | {d:.1} | {d:.0} | {s} |\n", .{
+                    rw.label, n, wall_ns / 1e6, mb(r.self.maxrss_kb + r.children.maxrss_kb), 100 * cpu_ns / all_ns, mode,
+                });
+            }
+            try w.flush();
+        }
         try w.print("\n", .{});
     }
 
