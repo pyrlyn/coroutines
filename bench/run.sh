@@ -15,7 +15,15 @@ else
 fi
 zigv=${ZIG_VERSION:-$(zig version 2>/dev/null || echo 0.17.0)}
 mkdir -p bench/results
-for suite in switch spawn procs; do
+if [ "$(uname -s)" = Darwin ]; then
+  ps=$(sysctl -n hw.pagesize); avail=$(( ( $(vm_stat | awk '/Pages free|Pages inactive|Pages speculative/{gsub(/\./,"",$NF); s+=$NF} END{print s}') * ps ) / 1048576 ))
+else
+  avail=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1024 ))
+fi
+export MEM_AVAILABLE_MB=$avail
+# 1024 worker processes need > 1024 pipe fds
+ulimit -n 4096 2>/dev/null || true
+for suite in ${SUITES:-switch spawn procs sweep}; do
   out=bench/results/$suite-$label.md
   {
     echo "# Benchmark: $suite ($label)"
@@ -25,6 +33,7 @@ for suite in switch spawn procs; do
     echo "- OS: $os"
     echo "- CPU: $cpu, $ncpu logical CPUs"
     echo "- Zig: $zigv, ReleaseFast"
+    echo "- Available RAM at start: $avail MB"
     echo
     nice -n 10 "$bin" "$suite"
   } > "$out"

@@ -240,29 +240,42 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         try g.await(tio);
         r.ns = now(io) - t0;
         r.check = out.load(.monotonic);
-    } else if (std.mem.eql(u8, name, "procs2")) {
-        // Two OS processes (this binary in worker mode), each doing half.
+    } else if (std.mem.eql(u8, name, "procs2") or std.mem.eql(u8, name, "procs")) {
+        // N OS processes (this binary in worker mode) splitting the tasks.
+        // Each child's peak RSS comes from its own wait4() rusage and is summed.
+        const n: usize = if (name.len == 6) 2 else if (extra.len > 0) try std.fmt.parseInt(usize, extra[0], 10) else 2;
         const exe = try std.process.executablePathAlloc(io, init.gpa);
         defer init.gpa.free(exe);
-        r.procs = 3;
+        const kids = try init.gpa.alloc(std.process.Child, n);
+        defer init.gpa.free(kids);
+        const bounds = try init.gpa.alloc([2][24]u8, n);
+        defer init.gpa.free(bounds);
+        r.procs = n + 1;
+        r.name = try std.fmt.allocPrint(init.arena.allocator(), "procs-{d}", .{n});
         const t0 = now(io);
-        var kids: [2]std.process.Child = undefined;
-        const ranges = [2][2][]const u8{ .{ "0", "5000" }, .{ "5000", "10000" } };
-        for (&kids, ranges) |*k, rg| {
-            k.* = try std.process.spawn(io, .{ .argv = &.{ exe, "worker", rg[0], rg[1] }, .stdout = .pipe });
+        for (kids, bounds, 0..) |*k, *bd, i| {
+            const lo = try std.fmt.bufPrint(&bd[0], "{d}", .{n_tasks * i / n});
+            const hi = try std.fmt.bufPrint(&bd[1], "{d}", .{n_tasks * (i + 1) / n});
+            k.* = try std.process.spawn(io, .{
+                .argv = &.{ exe, "worker", lo, hi },
+                .stdout = .pipe,
+                .request_resource_usage_statistics = true,
+            });
         }
         r.spawn_ns = now(io) - t0;
-        for (&kids) |*k| {
+        var rss_sum: u64 = 0;
+        for (kids) |*k| {
             var buf: [64]u8 = undefined;
             var rd = k.stdout.?.reader(io, &buf);
             const line = (try rd.interface.takeDelimiter('\n')) orelse "0";
             r.check +%= try std.fmt.parseInt(u64, std.mem.trim(u8, line, " \r"), 10);
             _ = try k.wait(io);
+            rss_sum += (k.resource_usage_statistics.getMaxRss() orelse 0) / 1024;
         }
         r.ns = now(io) - t0;
         r.children = usage(true);
+        r.children.maxrss_kb = rss_sum;
     } else {
-        _ = extra;
         return error.UnknownVariant;
     }
     if (r.allocs == 0) {
@@ -342,39 +355,81 @@ pub fn main(init: std.process.Init) !void {
     const exe = try std.process.executablePathAlloc(io, init.gpa);
     defer init.gpa.free(exe);
 
+    const header =
+        \\| variant | ops | total ns | ns/op | allocs | alloc bytes | threads | procs | spawn ns | peak RSS MB (self) | peak RSS MB (children, sum) | RSS MB total | minflt | majflt | vol ctxsw | invol ctxsw | child minflt | child vol ctxsw | child invol ctxsw |
+        \\|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+        \\
+    ;
     for (suites) |s| {
         if (!std.mem.eql(u8, which, "all") and !std.mem.eql(u8, which, s.name)) continue;
         try w.print("## {s}\n\n", .{s.title});
         try w.print("Median of {d} runs; each run is a fresh process. RSS = peak resident set of that process.\n\n", .{reps});
-        try w.print("| variant | ops | total ns | ns/op | allocs | alloc bytes | threads | procs | spawn ns | peak RSS MB (self) | peak RSS MB (children) | RSS MB total | minflt | majflt | vol ctxsw | invol ctxsw | child minflt | child vol ctxsw | child invol ctxsw |\n", .{});
-        try w.print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n", .{});
-        for (s.variants) |v| {
-            var runs: [reps]Result = undefined;
-            var names: [reps][32]u8 = undefined;
-            for (&runs, &names) |*r, *nb| {
-                const res = try std.process.run(init.gpa, io, .{ .argv = &.{ exe, "variant", v } });
-                defer init.gpa.free(res.stdout);
-                defer init.gpa.free(res.stderr);
-                r.* = parse(std.mem.trim(u8, res.stdout, " \r\n"), nb) catch {
-                    std.debug.print("variant {s} failed: {s}\n", .{ v, res.stderr });
-                    return error.VariantFailed;
-                };
-            }
-            std.mem.sortUnstable(Result, &runs, {}, struct {
-                fn lt(_: void, a: Result, b: Result) bool {
-                    return a.ns < b.ns;
-                }
-            }.lt);
-            const r = runs[reps / 2];
-            const nsop = @as(f64, @floatFromInt(r.ns)) / @as(f64, @floatFromInt(r.ops));
-            try w.print("| {s} | {d} | {d} | {d:.1} | {d} | {d} | {d} | {d} | {d} | {d:.1} | {d:.1} | {d:.1} | {d} | {d} | {d} | {d} | {d} | {d} | {d} |\n", .{
-                r.name,                 r.ops,                       r.ns,                                  nsop,
-                r.allocs,               r.alloc_bytes,               r.threads,                             r.procs,
-                r.spawn_ns,             mb(r.self.maxrss_kb),        mb(r.children.maxrss_kb),              mb(r.self.maxrss_kb + r.children.maxrss_kb * (r.procs - 1)),
-                r.self.minflt,          r.self.majflt,               r.self.nvcsw,                          r.self.nivcsw,
-                r.children.minflt,      r.children.nvcsw,            r.children.nivcsw,
-            });
-        }
+        try w.writeAll(header);
+        for (s.variants) |v| try row(w, try measure(init, exe, &.{v}, reps));
         try w.print("\n", .{});
     }
+
+    if (std.mem.eql(u8, which, "all") or std.mem.eql(u8, which, "sweep")) {
+        // Memory cap: 50% of available RAM (MEM_AVAILABLE_MB, set by bench/run.sh).
+        const avail_mb: u64 = if (init.environ_map.get("MEM_AVAILABLE_MB")) |m| std.fmt.parseInt(u64, m, 10) catch 4096 else 4096;
+        const cap_kb = avail_mb * 1024 / 2;
+        const sweep_reps = 3;
+        try w.print("## Process sweep: N worker processes vs coroutines, same 10,000 tasks\n\n", .{});
+        try w.print("Median of {d} runs. N doubles from 1 while N <= 1024 and the projected total RSS of the next N stays under 50% of available RAM ({d} MB of {d} MB). Children RSS = sum of each child's own peak RSS (wait4 rusage per child).\n\n", .{ sweep_reps, cap_kb / 1024, avail_mb });
+        try w.writeAll(header);
+        var n: usize = 1;
+        while (n <= 1024) : (n *= 2) {
+            var nb: [16]u8 = undefined;
+            const r = measure(init, exe, &.{ "procs", try std.fmt.bufPrint(&nb, "{d}", .{n}) }, sweep_reps) catch |e| {
+                try w.print("\nStopped at N = {d}: {t} (OS limit, see `ulimit -n` / `ulimit -u`).\n\n", .{ n, e });
+                break;
+            };
+            try row(w, r);
+            try w.flush();
+            const per_child = r.children.maxrss_kb / n;
+            if (r.self.maxrss_kb + per_child * n * 2 > cap_kb) {
+                try w.print("\nStopped: next N would exceed the memory cap.\n", .{});
+                break;
+            }
+        }
+        for ([_][]const u8{ "sm-parallel", "io-group" }) |v| try row(w, try measure(init, exe, &.{v}, sweep_reps));
+        try w.print("\n", .{});
+    }
+}
+
+fn measure(init: std.process.Init, exe: []const u8, vargs: []const []const u8, comptime n: usize) !Result {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const argv = try arena.alloc([]const u8, vargs.len + 2);
+    argv[0] = exe;
+    argv[1] = "variant";
+    @memcpy(argv[2..], vargs);
+    var runs: [n]Result = undefined;
+    for (&runs) |*r| {
+        const res = try std.process.run(init.gpa, io, .{ .argv = argv });
+        defer init.gpa.free(res.stdout);
+        defer init.gpa.free(res.stderr);
+        const nb = try arena.alloc(u8, 32);
+        r.* = parse(std.mem.trim(u8, res.stdout, " \r\n"), nb) catch {
+            std.debug.print("variant {s} failed: {s}\n", .{ vargs[0], res.stderr });
+            return error.VariantFailed;
+        };
+    }
+    std.mem.sortUnstable(Result, &runs, {}, struct {
+        fn lt(_: void, a: Result, b: Result) bool {
+            return a.ns < b.ns;
+        }
+    }.lt);
+    return runs[n / 2];
+}
+
+fn row(w: *Io.Writer, r: Result) !void {
+    const nsop = @as(f64, @floatFromInt(r.ns)) / @as(f64, @floatFromInt(r.ops));
+    try w.print("| {s} | {d} | {d} | {d:.1} | {d} | {d} | {d} | {d} | {d} | {d:.1} | {d:.1} | {d:.1} | {d} | {d} | {d} | {d} | {d} | {d} | {d} |\n", .{
+        r.name,            r.ops,                r.ns,                     nsop,
+        r.allocs,          r.alloc_bytes,        r.threads,                r.procs,
+        r.spawn_ns,        mb(r.self.maxrss_kb), mb(r.children.maxrss_kb), mb(r.self.maxrss_kb + r.children.maxrss_kb),
+        r.self.minflt,     r.self.majflt,        r.self.nvcsw,             r.self.nivcsw,
+        r.children.minflt, r.children.nvcsw,     r.children.nivcsw,
+    });
 }
