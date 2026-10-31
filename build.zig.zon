@@ -1,0 +1,7 @@
+.{
+    .name = .coroutines,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x4b57082b3080e685,
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md" },
+}
