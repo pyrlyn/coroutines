@@ -11,16 +11,49 @@
 const std = @import("std");
 const Io = std.Io;
 
-/// True when the standard library provides an evented `Io` for this target.
+/// True when the standard library provides an evented `Io` (green threads)
+/// for this target. Experimental in Zig 0.17; false on Windows.
 pub const evented_available = @TypeOf(Io.Evented) == type and Io.Evented != void;
 
-/// Spawns `function(ctx, i)` for i in `0..n` into `group` via `Group.async`.
+/// Spawns `function(ctx, i)` for every `i` in `0..n` into `group`.
+///
+/// Params:
+/// * `function` — `fn (@TypeOf(ctx), usize) Io.Cancelable!void`.
+/// * `ctx` — passed by value to every task; use a pointer for shared state.
+///
+/// Does not wait: call `group.await(io)` (or `group.cancel(io)`) afterwards.
+/// Tasks may run inline, on other threads, or not until `await`, depending on
+/// the `Io` (`Group.async` semantics).
+///
+/// ```zig
+/// fn work(sum: *std.atomic.Value(u64), i: usize) std.Io.Cancelable!void {
+///     _ = sum.fetchAdd(i, .monotonic);
+/// }
+/// var sum: std.atomic.Value(u64) = .init(0);
+/// var group: std.Io.Group = .init;
+/// spawnEach(io, &group, 10_000, work, &sum);
+/// try group.await(io);
+/// ```
 pub fn spawnEach(io: Io, group: *Io.Group, n: usize, comptime function: anytype, ctx: anytype) void {
     for (0..n) |i| group.async(io, function, .{ ctx, i });
 }
 
-/// A pool of `workers` coroutines consuming `Msg`s from a bounded queue and
-/// calling `handler(ctx, msg)` for each. Must not be moved after `start`.
+/// A pool of worker coroutines consuming `Msg`s from a bounded queue
+/// (`Io.Queue`) and calling `handler(ctx, msg)` for each.
+///
+/// Lifecycle: `init` → `start(n)` → `submit`… → `shutdown()` (drain and wait)
+/// or `cancel()` (stop now). The value must not be moved after `start`
+/// (workers keep a pointer to it). The struct fields are internal.
+///
+/// ```zig
+/// fn handle(total: *u64, msg: u64) void { total.* += msg; } // 1 worker: no race
+/// var total: u64 = 0;
+/// var buf: [64]u64 = undefined;
+/// var d: Dispatcher(u64, *u64, handle) = .init(io, &total, &buf);
+/// try d.start(1);
+/// for (0..100) |i| try d.submit(i);
+/// try d.shutdown();
+/// ```
 pub fn Dispatcher(comptime Msg: type, comptime Ctx: type, comptime handler: fn (Ctx, Msg) void) type {
     return struct {
         const Self = @This();
@@ -30,12 +63,14 @@ pub fn Dispatcher(comptime Msg: type, comptime Ctx: type, comptime handler: fn (
         queue: Io.Queue(Msg),
         group: Io.Group = .init,
 
-        /// `buffer` is the queue storage (caller-owned; its length is the capacity).
+        /// Creates a stopped dispatcher. `buffer` is the queue storage
+        /// (caller-owned, must outlive the dispatcher); its length is the
+        /// capacity, after which `submit` blocks.
         pub fn init(io: Io, ctx: Ctx, buffer: []Msg) Self {
             return .{ .io = io, .ctx = ctx, .queue = .init(buffer) };
         }
 
-        /// Starts the workers. They must run concurrently with the producer,
+        /// Starts `workers` worker coroutines. Call once. They must run concurrently with the producer,
         /// so this uses `Group.concurrent` and fails with
         /// `error.ConcurrencyUnavailable` if the `Io` cannot provide that.
         pub fn start(self: *Self, workers: usize) Io.ConcurrentError!void {
@@ -56,6 +91,7 @@ pub fn Dispatcher(comptime Msg: type, comptime Ctx: type, comptime handler: fn (
         }
 
         /// Enqueues a message, blocking (cooperatively) while the queue is full.
+        /// Returns `error.Closed` after `shutdown`/`cancel`.
         pub fn submit(self: *Self, msg: Msg) (Io.QueueClosedError || Io.Cancelable)!void {
             try self.queue.putOne(self.io, msg);
         }
