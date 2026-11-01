@@ -255,4 +255,4 @@ Measured:
 
 ## License
 
-No license file yet (pyrlyn/jit, the reference repo, has none either).
+Licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
