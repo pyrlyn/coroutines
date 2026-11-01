@@ -130,6 +130,20 @@ pub const Cursor = struct {
         if (start >= c.total) return null;
         return .{ .start = start, .end = @min(start + c.chunk, c.total) };
     }
+
+    /// Like `claim`, but the chunk shrinks towards 1 as the queue drains:
+    /// `clamp(remaining / (2 * workers), 1, chunk)`. Early claims stay large
+    /// (few atomics); the last ones are small, so no worker is left holding a
+    /// big chunk while the others are idle. One `cmpxchg` loop per claim.
+    pub fn claimTapered(c: *Cursor, workers: usize) ?Range {
+        var start = c.next.load(.monotonic);
+        while (start < c.total) {
+            const size = std.math.clamp((c.total - start) / (2 * @max(1, workers)), 1, c.chunk);
+            start = c.next.cmpxchgWeak(start, start + size, .monotonic, .monotonic) orelse
+                return .{ .start = start, .end = start + size };
+        }
+        return null;
+    }
 };
 
 /// Runs tasks on up to `opts.threads` OS threads (including the caller's),
@@ -145,7 +159,10 @@ pub const Cursor = struct {
 /// ```
 /// Work distribution is a
 /// lock-free queue: one `Cursor` over `tasks`; each worker claims a chunk
-/// and runs it round-robin to completion, then claims the next. The
+/// (`Cursor.claimTapered`: at most `opts.chunk`, smaller near the end)
+/// and runs it round-robin to completion, then claims the next. Unlike
+/// `runAll`, tasks larger than two words in chunks of up to 1024 are not
+/// moved, so the slice keeps its order. The
 /// calling thread works too unless `opts.caller_works` is
 /// false. All spawned threads are joined before returning (deterministic
 /// shutdown), also on cancellation. If a thread cannot be spawned, the run
@@ -153,10 +170,11 @@ pub const Cursor = struct {
 pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!void {
     checkTask(T);
     const want = if (opts.threads == 0) (std.Thread.getCpuCount() catch 1) else opts.threads;
-    var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel };
+    var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel, .workers = 1 };
     // More workers than chunks would only spawn threads that find the queue empty.
     const chunks = (tasks.len + shared.cursor.chunk - 1) / shared.cursor.chunk;
     const n = @max(1, @min(want, max_threads, chunks));
+    shared.workers = n;
     var handles: [max_threads]std.Thread = undefined;
     const first: usize = @intFromBool(opts.caller_works);
     var spawned: usize = 0;
@@ -254,7 +272,7 @@ pub const Pool = struct {
 
     pub fn run(p: *Pool, comptime T: type, tasks: []T, opts: RunOptions) Error!void {
         checkTask(T);
-        var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel };
+        var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel, .workers = 1 };
         const Thunk = struct {
             fn work(ctx: *anyopaque, index: usize) void {
                 const s: *Shared(T) = @ptrCast(@alignCast(ctx));
@@ -266,6 +284,7 @@ pub const Pool = struct {
             const chunks = (tasks.len + shared.cursor.chunk - 1) / shared.cursor.chunk;
             k = @min(k, chunks -| 1);
         }
+        shared.workers = k + 1;
         if (k == 0) {
             shared.worker(0);
             if (shared.canceled.load(.acquire)) return error.Canceled;
@@ -366,20 +385,50 @@ pub const Pool = struct {
     }
 };
 
+/// Largest chunk `runParallel` steps through an index array (2 KiB of stack).
+const max_indexed = 1024;
+
 fn Shared(comptime T: type) type {
     return struct {
         tasks: []T,
         cursor: Cursor,
         cancel: ?*const std.atomic.Value(bool),
+        workers: usize,
         canceled: std.atomic.Value(bool) = .init(false),
+
+        // Tasks bigger than two words are not moved: a finished task leaves the
+        // round by overwriting its u16 index instead of swapping the whole `T`.
+        const use_indexed = @sizeOf(T) > 2 * @sizeOf(usize);
+
+        /// `runAll` over at most `max_indexed` tasks without permuting them.
+        fn runIndexed(tasks: []T, cancel: ?*const std.atomic.Value(bool)) Error!u64 {
+            var idx: [max_indexed]u16 = undefined;
+            for (idx[0..tasks.len], 0..) |*x, i| x.* = @intCast(i);
+            var live = tasks.len;
+            var steps: u64 = 0;
+            while (live > 0) {
+                if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+                var i: usize = 0;
+                while (i < live) {
+                    steps += 1;
+                    if (tasks[idx[i]].step() == .done) {
+                        live -= 1;
+                        idx[i] = idx[live];
+                    } else i += 1;
+                }
+            }
+            return steps;
+        }
 
         fn worker(s: *@This(), index: usize) void {
             // A step may run `runParallel` itself; its worker must get this index back.
             const outer = current_worker;
             current_worker = index;
             defer current_worker = outer;
-            while (s.cursor.claim()) |r| {
-                _ = runAll(T, s.tasks[r.start..r.end], s.cancel) catch {
+            while (s.cursor.claimTapered(s.workers)) |r| {
+                const chunk = s.tasks[r.start..r.end];
+                const res = if (use_indexed and chunk.len <= max_indexed) runIndexed(chunk, s.cancel) else runAll(T, chunk, s.cancel);
+                _ = res catch {
                     s.canceled.store(true, .release);
                     return;
                 };
@@ -645,4 +694,20 @@ test "Pool with every spin mode, small and large runs" {
             for (tasks[0..n]) |t| try testing.expectEqual(expected(t.id, 3), t.acc);
         };
     };
+}
+
+test "Cursor.claimTapered hands out every index once, shrinking to 1" {
+    var c: Cursor = .init(1000, 64);
+    var seen: [1000]bool = @splat(false);
+    var last: usize = 64;
+    while (c.claimTapered(4)) |r| {
+        try testing.expect(r.end > r.start and r.end - r.start <= 64);
+        last = r.end - r.start;
+        for (seen[r.start..r.end]) |*b| {
+            try testing.expect(!b.*);
+            b.* = true;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), last);
+    for (seen) |b| try testing.expect(b);
 }
