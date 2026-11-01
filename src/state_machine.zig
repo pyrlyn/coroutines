@@ -168,6 +168,133 @@ pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!vo
     if (shared.canceled.load(.acquire)) return error.Canceled;
 }
 
+/// Options for `Pool.init`. All fields have defaults: `.{}` is valid.
+pub const PoolOptions = struct {
+    /// Total worker count including the thread that calls `run`. 0 = CPU count.
+    threads: usize = 0,
+    /// Stack size for the pool's threads (steps run on it).
+    stack_size: usize = worker_stack_size,
+};
+
+/// Options for `Pool.run`. All fields have defaults: `.{}` is valid.
+pub const RunOptions = struct {
+    /// Tasks claimed from the shared queue at a time.
+    chunk: usize = 64,
+    /// Cooperative cancellation flag, checked between rounds.
+    cancel: ?*const std.atomic.Value(bool) = null,
+};
+
+/// Long-lived worker threads for repeated `runParallel`-style runs.
+///
+/// `runParallel` spawns and joins its threads on every call; for many small
+/// runs that is most of the cost. A `Pool` spawns them once; between runs
+/// they spin briefly, then sleep on a futex (no CPU). `run` works like `runParallel` with
+/// `caller_works = true`: the caller is worker 0.
+///
+/// Rules: a `Pool` must not move after `init` (threads hold a pointer to it);
+/// one `run` at a time; a step must not call `run` on the same pool (it would
+/// wait for itself), use `runParallel` for nested parallelism.
+///
+/// ```zig
+/// var pool: Pool = undefined;
+/// pool.init(io, .{});
+/// defer pool.deinit();
+/// for (batches) |batch| try pool.run(Task, batch, .{});
+/// ```
+pub const Pool = struct {
+    io: std.Io,
+    handles: [max_threads]std.Thread = undefined,
+    spawned: usize = 0,
+    /// Bumped once per `run` (and by `deinit`); workers sleep on it.
+    gen: std.atomic.Value(u32) = .init(0),
+    /// Spawned workers still inside the current run; the caller sleeps on it.
+    pending: std.atomic.Value(u32) = .init(0),
+    stop: bool = false,
+    job_ctx: *anyopaque = undefined,
+    job_fn: *const fn (*anyopaque, usize) void = undefined,
+
+    /// Polls of a flag before sleeping on its futex (a few microseconds).
+    const spin_limit = 4096;
+
+    /// Spawns `threads - 1` workers. Fewer if a spawn fails; the pool still works.
+    /// `io` is used only to sleep and wake on futexes.
+    pub fn init(p: *Pool, io: std.Io, opts: PoolOptions) void {
+        p.* = .{ .io = io };
+        const want = if (opts.threads == 0) (std.Thread.getCpuCount() catch 1) else opts.threads;
+        const n = @max(1, @min(want, max_threads));
+        while (p.spawned + 1 < n) : (p.spawned += 1) {
+            p.handles[p.spawned] = std.Thread.spawn(.{ .stack_size = opts.stack_size }, loop, .{ p, p.spawned + 1 }) catch break;
+        }
+    }
+
+    /// Wakes and joins every worker.
+    pub fn deinit(p: *Pool) void {
+        p.stop = true;
+        _ = p.gen.fetchAdd(1, .release);
+        p.io.futexWake(u32, &p.gen.raw, std.math.maxInt(u32));
+        for (p.handles[0..p.spawned]) |h| h.join();
+        p.* = undefined;
+    }
+
+    /// Worker count including the caller of `run`.
+    pub fn workers(p: *const Pool) usize {
+        return p.spawned + 1;
+    }
+
+    /// Runs every task to completion on the pool, like `runParallel`.
+    /// Returns when all workers are back asleep, or `error.Canceled`.
+    pub fn run(p: *Pool, comptime T: type, tasks: []T, opts: RunOptions) Error!void {
+        checkTask(T);
+        var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel };
+        const Thunk = struct {
+            fn work(ctx: *anyopaque, index: usize) void {
+                const s: *Shared(T) = @ptrCast(@alignCast(ctx));
+                s.worker(index);
+            }
+        };
+        p.job_ctx = &shared;
+        p.job_fn = Thunk.work;
+        p.pending.store(@intCast(p.spawned), .monotonic);
+        _ = p.gen.fetchAdd(1, .release);
+        if (p.spawned > 0) p.io.futexWake(u32, &p.gen.raw, std.math.maxInt(u32));
+        shared.worker(0);
+        var spins: usize = 0;
+        while (true) {
+            const left = p.pending.load(.acquire);
+            if (left == 0) break;
+            if (spins < spin_limit) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            p.io.futexWaitUncancelable(u32, &p.pending.raw, left);
+        }
+        if (shared.canceled.load(.acquire)) return error.Canceled;
+    }
+
+    fn loop(p: *Pool, index: usize) void {
+        var seen: u32 = 0;
+        while (true) {
+            var g = p.gen.load(.acquire);
+            // Back-to-back runs: a short spin catches the next run without a
+            // futex sleep and wake-up; after that, sleep.
+            var spins: usize = 0;
+            while (g == seen and spins < spin_limit) : (spins += 1) {
+                std.atomic.spinLoopHint();
+                g = p.gen.load(.acquire);
+            }
+            while (g == seen) {
+                p.io.futexWaitUncancelable(u32, &p.gen.raw, seen);
+                g = p.gen.load(.acquire);
+            }
+            seen = g;
+            if (p.stop) return;
+            p.job_fn(p.job_ctx, index);
+            if (p.pending.fetchSub(1, .acq_rel) == 1) p.io.futexWake(u32, &p.pending.raw, 1);
+        }
+    }
+};
+
 fn Shared(comptime T: type) type {
     return struct {
         tasks: []T,
@@ -398,4 +525,36 @@ test "cancellation stops all workers and joins them" {
     try testing.expectError(error.Canceled, runParallel(Forever, &tasks, .{ .threads = 3, .chunk = 256, .cancel = &cancel }));
     th.join();
     try testing.expectError(error.Canceled, runAll(Forever, &tasks, &cancel));
+}
+
+test "Pool runs many batches and shuts down" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var pool: Pool = undefined;
+    pool.init(threaded.io(), .{ .threads = 4 });
+    defer pool.deinit();
+    var tasks: [256]Counter = undefined;
+    for (0..200) |round| {
+        for (&tasks, 0..) |*t, i| t.* = .{ .id = @intCast(i + round), .left = 3 };
+        try pool.run(Counter, &tasks, .{ .chunk = 8 });
+        for (tasks) |t| {
+            try testing.expect(t.state == .finished);
+            try testing.expectEqual(expected(t.id, 3), t.acc);
+        }
+    }
+}
+
+test "Pool.run observes cancel" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var pool: Pool = undefined;
+    pool.init(threaded.io(), .{ .threads = 3 });
+    defer pool.deinit();
+    var cancel: std.atomic.Value(bool) = .init(true);
+    var tasks: [64]Counter = undefined;
+    for (&tasks, 0..) |*t, i| t.* = .{ .id = @intCast(i), .left = 5 };
+    try testing.expectError(error.Canceled, pool.run(Counter, &tasks, .{ .cancel = &cancel }));
+    cancel.store(false, .release);
+    for (&tasks, 0..) |*t, i| t.* = .{ .id = @intCast(i), .left = 5 };
+    try pool.run(Counter, &tasks, .{});
 }

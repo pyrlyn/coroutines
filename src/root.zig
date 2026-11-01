@@ -5,7 +5,8 @@
 //! * `state_machine` — stackless, allocation-free coroutines. A coroutine is
 //!   any struct with `pub fn step(self: *T) Step`.
 //!   `runAll` (one thread), `runParallel` (N threads), `ParallelOptions`,
-//!   `Step`, `Error`, and `Cursor`, the index queue behind `runParallel`.
+//!   `Step`, `Error`, `Cursor` (the index queue behind `runParallel`), and
+//!   `Pool` (long-lived workers for repeated runs).
 //! * `io` — coroutines on `std.Io`: `spawnEach` (many tasks into an
 //!   `Io.Group`), `Dispatcher` (worker pool over a bounded `Io.Queue`),
 //!   `evented_available`.
