@@ -53,6 +53,7 @@ const SkewTask = struct {
     acc: u64,
     left: u16,
     out: *std.atomic.Value(u64),
+    /// One slice of work; `.done` after `left` slices (adds `acc` to `out`).
     pub fn step(t: *SkewTask) sm.Step {
         t.acc = sliceWork(t.acc);
         t.left -= 1;
@@ -70,6 +71,8 @@ const BigTask = struct {
     left: u8,
     out: *std.atomic.Value(u64),
     payload: [480]u8 = undefined,
+    /// One slice of work; `.done` after `left` slices (adds `acc` to `out`).
+    /// The 480-byte payload is never touched; it only makes the task large.
     pub fn step(t: *BigTask) sm.Step {
         t.acc = sliceWork(t.acc);
         t.left -= 1;

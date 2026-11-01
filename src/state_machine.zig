@@ -5,6 +5,16 @@
 //! back to the scheduler or `.done` when finished. Switching is a plain
 //! function return + call: no allocation, no stack switching. Tasks live in
 //! caller-provided storage (a slice of `T`).
+//!
+//! Schedulers, from lowest to highest level:
+//! * `runAll` — one thread, round-robin; no threads, no allocation.
+//! * `runParallel` — one batch on N threads that are spawned and joined per
+//!   call. Use it for a single large batch or for nested parallelism.
+//! * `Pool` — the same work loop on long-lived threads. Use it when the same
+//!   process runs many batches back to back (per-call spawn/join dominates
+//!   small batches). Idle pool threads wait as set by `PoolOptions.spin`
+//!   (default `.none`: futex sleep, no spinning) and `run` wakes only as many
+//!   threads as the batch has chunks (`PoolOptions.cap_wake`, default on).
 const std = @import("std");
 
 /// What a coroutine's `step` returns.
@@ -186,16 +196,28 @@ pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!vo
     if (shared.canceled.load(.acquire)) return error.Canceled;
 }
 
-/// How an idle pool thread waits before sleeping on a futex.
+/// How an idle pool thread (and the `run` caller waiting for the last worker)
+/// waits before sleeping on a futex.
+///
+/// Choosing (Apple M3 Max, 16 threads, bench/results/pool-*): with
+/// `cap_wake = true`, `.none` stayed within a few percent of `runParallel`
+/// CPU at every batch size and was as fast as any spin mode, so it is the
+/// default. Spinning only pays when batches arrive back to back within the
+/// spin window and wake-up latency matters more than CPU; it costs CPU on
+/// every idle gap (up to +2000% CPU on tiny batches when all threads spin).
 pub const Spin = union(enum) {
     /// No spinning: sleep on the futex right away (event-only wake-up).
+    /// Zero idle CPU. Default.
     none,
-    /// Poll this many times, then sleep (PR #13 behaviour: 4096).
+    /// Poll this many times, then sleep (PR #13 used 4096). Duration depends
+    /// on the CPU; prefer `.ns`.
     iterations: u32,
-    /// Poll for up to this many nanoseconds, then sleep.
+    /// Poll for up to this many nanoseconds, then sleep. Bounds wasted CPU
+    /// per idle period to about `ns` per thread.
     ns: u32,
     /// Per-thread budget in [0, max_ns]: doubled when the event arrived while
-    /// spinning, halved when the thread had to sleep. Idle pools stop spinning.
+    /// spinning, halved when the thread had to sleep. Idle pools stop spinning;
+    /// steady back-to-back runs spin up to `max_ns`.
     adaptive: struct { start_ns: u32 = 4_000, max_ns: u32 = 50_000 },
 };
 
@@ -207,9 +229,12 @@ pub const PoolOptions = struct {
     stack_size: usize = worker_stack_size,
     /// How idle threads wait for the next run (and the caller for the last worker).
     spin: Spin = default_spin,
-    /// Wake only as many threads as there are chunks to share.
+    /// Wake only min(threads - 1, chunks - 1) threads per run, so small runs
+    /// do not wake threads that would find the queue empty. Default on; this
+    /// is what removes idle CPU on small batches.
     cap_wake: bool = default_cap_wake,
     /// After spinning, yield the CPU this many times before sleeping.
+    /// Default 0; measured worse than plain futex sleep.
     yields: u8 = default_yields,
 };
 const default_spin: Spin = .none;
@@ -218,9 +243,12 @@ const default_yields = 0;
 
 /// Options for `Pool.run`. All fields have defaults: `.{}` is valid.
 pub const RunOptions = struct {
-    /// Tasks claimed from the shared queue at a time.
+    /// Tasks claimed from the shared queue at a time (the queue hands out
+    /// smaller chunks as it drains). Also sets how many threads a run wakes
+    /// with `cap_wake`: one per chunk.
     chunk: usize = 64,
-    /// Cooperative cancellation flag, checked between rounds.
+    /// Cooperative cancellation flag, checked between rounds; when set,
+    /// `run` returns `error.Canceled` and unfinished tasks stay as they are.
     cancel: ?*const std.atomic.Value(bool) = null,
 };
 
@@ -248,6 +276,10 @@ pub const Pool = struct {
     job_ctx: *anyopaque = undefined,
     job_fn: *const fn (*anyopaque, usize) void = undefined,
 
+    /// Initializes `p` in place and spawns `threads - 1` workers (fewer if a
+    /// spawn fails; the pool still works, down to the caller alone).
+    /// `io` is used only to sleep and wake on futexes (and read the clock for
+    /// `.ns` / `.adaptive` spin). `p` must not move until `deinit`.
     pub fn init(p: *Pool, io: std.Io, opts: PoolOptions) void {
         p.* = .{ .io = io, .opts = opts };
         p.caller_budget = startBudget(opts.spin);
@@ -258,6 +290,8 @@ pub const Pool = struct {
         }
     }
 
+    /// Wakes and joins every worker. Must not overlap a `run`.
+    /// `p` is undefined afterwards.
     pub fn deinit(p: *Pool) void {
         @atomicStore(bool, &p.stop, true, .release);
         _ = p.gen.fetchAdd(1, .release);
@@ -266,10 +300,17 @@ pub const Pool = struct {
         p.* = undefined;
     }
 
+    /// Worker count including the caller of `run`.
     pub fn workers(p: *const Pool) usize {
         return p.spawned + 1;
     }
 
+    /// Runs every task to completion on the pool, like `runParallel` with
+    /// `caller_works = true` (the caller is worker 0). Blocks until all
+    /// participating workers are done; then `tasks` is safe to reuse.
+    /// With `cap_wake`, a run of at most one chunk wakes no thread.
+    /// Returns `error.Canceled` if `opts.cancel` was observed set.
+    /// One `run` at a time per pool; do not call it from inside a step.
     pub fn run(p: *Pool, comptime T: type, tasks: []T, opts: RunOptions) Error!void {
         checkTask(T);
         var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel, .workers = 1 };
