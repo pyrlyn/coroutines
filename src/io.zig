@@ -15,7 +15,10 @@ const Io = std.Io;
 /// for this target. Experimental in Zig 0.17; false on Windows.
 pub const evented_available = @TypeOf(Io.Evented) == type and Io.Evented != void;
 
-/// Spawns `function(ctx, i)` for every `i` in `0..n` into `group`.
+/// Runs `function(ctx, i)` for every `i` in `0..n` inside `group`. Indices
+/// are split into `4 * CPU count` contiguous blocks, one group task each;
+/// the calls inside a block run in order on that task, and a call that
+/// returns `error.Canceled` skips the rest of its block.
 ///
 /// Params:
 /// * `function` — `fn (@TypeOf(ctx), usize) Io.Cancelable!void`.
@@ -35,7 +38,21 @@ pub const evented_available = @TypeOf(Io.Evented) == type and Io.Evented != void
 /// try group.await(io);
 /// ```
 pub fn spawnEach(io: Io, group: *Io.Group, n: usize, comptime function: anytype, ctx: anytype) void {
-    for (0..n) |i| group.async(io, function, .{ ctx, i });
+    // One group task per contiguous block of indices, not per index: a task
+    // costs an allocation and usually a thread handoff, a loop iteration does not.
+    const blocks = @min(n, (std.Thread.getCpuCount() catch 1) * blocks_per_cpu);
+    for (0..blocks) |b| group.async(io, Block(function, @TypeOf(ctx)).run, .{ ctx, n * b / blocks, n * (b + 1) / blocks });
+}
+
+/// Blocks per CPU in `spawnEach`: more than one so uneven tasks still balance.
+const blocks_per_cpu = 4;
+
+fn Block(comptime function: anytype, comptime Ctx: type) type {
+    return struct {
+        fn run(ctx: Ctx, lo: usize, hi: usize) Io.Cancelable!void {
+            for (lo..hi) |i| try function(ctx, i);
+        }
+    };
 }
 
 /// A pool of worker coroutines consuming `Msg`s from a bounded queue
