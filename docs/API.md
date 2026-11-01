@@ -10,9 +10,10 @@ Public surface (everything else is internal):
 | `coro.state_machine.Error` | error set | `error.Canceled` |
 | `coro.state_machine.runAll` | fn | run tasks round-robin on the calling thread |
 | `coro.state_machine.runParallel` | fn | run tasks on N OS threads |
-| `coro.state_machine.ParallelOptions` | struct | `threads`, `chunk`, `cancel` |
+| `coro.state_machine.ParallelOptions` | struct | `threads`, `chunk`, `cancel`, `stack_size`, `caller_works` |
+| `coro.state_machine.currentWorker` | fn | index of the `runParallel` worker running on this thread |
 | `coro.state_machine.max_threads` | const | 64, upper bound for `threads` |
-| `coro.state_machine.worker_stack_size` | const | 1 MiB stack per worker thread |
+| `coro.state_machine.worker_stack_size` | const | 1 MiB, default stack per worker thread |
 | `coro.io.spawnEach` | fn | spawn `n` tasks into a `std.Io.Group` |
 | `coro.io.Dispatcher` | fn → type | worker pool over a bounded `std.Io.Queue` |
 | `coro.io.evented_available` | const bool | evented `std.Io` exists on this target |
@@ -54,7 +55,8 @@ const steps = try coro.state_machine.runAll(Countdown, &tasks, null); // 6
 
 ### `runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!void`
 
-Runs tasks on up to `opts.threads` threads, the calling thread included. Workers claim
+Runs tasks on up to `opts.threads` threads, the calling thread included unless
+`opts.caller_works` is false. Workers claim
 chunks of `opts.chunk` tasks from one atomic cursor and run each chunk with `runAll`. Every
 task is stepped by exactly one thread, so its own fields need no locking; shared state does.
 All threads are joined before returning, also on cancellation. If the OS refuses a thread,
@@ -67,11 +69,19 @@ the run continues with fewer workers.
 | `threads` | `0` | total workers incl. caller; `0` = CPU count; capped at `max_threads` |
 | `chunk` | `64` | tasks claimed at once; larger = less contention, worse balance |
 | `cancel` | `null` | `?*const std.atomic.Value(bool)`; set to `true` to stop |
+| `stack_size` | `worker_stack_size` | stack of each spawned worker; the caller keeps its own |
+| `caller_works` | `true` | `false`: the caller only waits and `threads` workers are spawned; if none spawns, it works anyway |
 
 ```zig
 var cancel: std.atomic.Value(bool) = .init(false);
 try coro.state_machine.runParallel(Countdown, tasks, .{ .threads = 4, .cancel = &cancel });
 ```
+
+### `currentWorker() ?usize`
+
+This thread's index in the innermost `runParallel` it is working in, in `0..opts.threads`,
+or `null` outside one. A calling thread that works is index 0. Use it to reach per-worker
+state from a `step`.
 
 ## `io`
 
