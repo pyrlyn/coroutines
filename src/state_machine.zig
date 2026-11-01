@@ -98,6 +98,40 @@ pub fn currentWorker() ?usize {
     return current_worker;
 }
 
+/// A half-open range of indices claimed from a `Cursor`.
+pub const Range = struct { start: usize, end: usize };
+
+/// Hands out `[0, total)` in chunks, each index exactly once, to any number of
+/// threads. Lock-free: one `fetchAdd` per claim. This is `runParallel`'s work
+/// queue, for loops over indices that are not coroutines. A claim synchronises
+/// nothing, so what the items need must be visible before the threads start.
+/// The fields are internal: make one with `init`.
+///
+/// ```zig
+/// var cursor: Cursor = .init(items.len, 64);
+/// // on every thread:
+/// while (cursor.claim()) |r| for (items[r.start..r.end]) |*item| process(item);
+/// ```
+pub const Cursor = struct {
+    next: std.atomic.Value(usize) = .init(0),
+    total: usize,
+    chunk: usize,
+
+    /// `chunk` is clamped to `1..total`: a claim has to move the cursor, and a
+    /// chunk near the top of `usize` would wrap it back to indices already
+    /// handed out.
+    pub fn init(total: usize, chunk: usize) Cursor {
+        return .{ .total = total, .chunk = std.math.clamp(chunk, 1, @max(1, total)) };
+    }
+
+    /// The next chunk, or `null` when every index has been handed out.
+    pub fn claim(c: *Cursor) ?Range {
+        const start = c.next.fetchAdd(c.chunk, .monotonic);
+        if (start >= c.total) return null;
+        return .{ .start = start, .end = @min(start + c.chunk, c.total) };
+    }
+};
+
 /// Runs tasks on up to `opts.threads` OS threads (including the caller's).
 ///
 /// Params: `T` and `tasks` as in `runAll`; `opts` see `ParallelOptions`.
@@ -109,9 +143,9 @@ pub fn currentWorker() ?usize {
 /// try runParallel(Countdown, tasks, .{ .threads = 4, .chunk = 64 });
 /// ```
 /// Work distribution is a
-/// lock-free queue: one atomic cursor over `tasks`; each worker claims a
-/// chunk with `fetchAdd` and runs it round-robin to completion, then claims
-/// the next. The calling thread works too unless `opts.caller_works` is
+/// lock-free queue: one `Cursor` over `tasks`; each worker claims a chunk
+/// and runs it round-robin to completion, then claims the next. The
+/// calling thread works too unless `opts.caller_works` is
 /// false. All spawned threads are joined before returning (deterministic
 /// shutdown), also on cancellation. If a thread cannot be spawned, the run
 /// continues with fewer workers.
@@ -119,7 +153,7 @@ pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!vo
     checkTask(T);
     const want = if (opts.threads == 0) (std.Thread.getCpuCount() catch 1) else opts.threads;
     const n = @max(1, @min(want, max_threads));
-    var shared: Shared(T) = .{ .tasks = tasks, .chunk = @max(1, opts.chunk), .cancel = opts.cancel };
+    var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel };
     var handles: [max_threads]std.Thread = undefined;
     const first: usize = @intFromBool(opts.caller_works);
     var spawned: usize = 0;
@@ -134,9 +168,8 @@ pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!vo
 fn Shared(comptime T: type) type {
     return struct {
         tasks: []T,
-        chunk: usize,
+        cursor: Cursor,
         cancel: ?*const std.atomic.Value(bool),
-        next: std.atomic.Value(usize) = .init(0),
         canceled: std.atomic.Value(bool) = .init(false),
 
         fn worker(s: *@This(), index: usize) void {
@@ -144,11 +177,8 @@ fn Shared(comptime T: type) type {
             const outer = current_worker;
             current_worker = index;
             defer current_worker = outer;
-            while (true) {
-                const start = s.next.fetchAdd(s.chunk, .monotonic);
-                if (start >= s.tasks.len) return;
-                const end = @min(start + s.chunk, s.tasks.len);
-                _ = runAll(T, s.tasks[start..end], s.cancel) catch {
+            while (s.cursor.claim()) |r| {
+                _ = runAll(T, s.tasks[r.start..r.end], s.cancel) catch {
                     s.canceled.store(true, .release);
                     return;
                 };
@@ -228,6 +258,48 @@ test "runParallel uses several threads and completes all tasks" {
         }
     }
     if ((std.Thread.getCpuCount() catch 1) > 1) try testing.expect(distinct >= 2);
+}
+
+test "Cursor hands out every index once" {
+    var c: Cursor = .init(10, 3);
+    var seen: [10]u8 = @splat(0);
+    while (c.claim()) |r| for (r.start..r.end) |i| {
+        seen[i] += 1;
+    };
+    for (seen) |s| try testing.expectEqual(@as(u8, 1), s);
+}
+
+test "Cursor stays exhausted at any chunk size" {
+    var empty: Cursor = .init(0, 0);
+    try testing.expectEqual(@as(?Range, null), empty.claim());
+
+    var zero: Cursor = .init(2, 0);
+    try testing.expectEqual(@as(?Range, .{ .start = 0, .end = 1 }), zero.claim());
+    try testing.expectEqual(@as(?Range, .{ .start = 1, .end = 2 }), zero.claim());
+    try testing.expectEqual(@as(?Range, null), zero.claim());
+
+    var huge: Cursor = .init(3, std.math.maxInt(usize) / 2 + 1);
+    try testing.expectEqual(@as(?Range, .{ .start = 0, .end = 3 }), huge.claim());
+    for (0..4) |_| try testing.expectEqual(@as(?Range, null), huge.claim());
+}
+
+const Claimer = struct {
+    fn run(cursor: *Cursor, seen: []std.atomic.Value(u32)) void {
+        while (cursor.claim()) |r| for (seen[r.start..r.end]) |*s| {
+            _ = s.fetchAdd(1, .monotonic);
+        };
+    }
+};
+
+test "Cursor gives each index to one thread only" {
+    const seen = try testing.allocator.alloc(std.atomic.Value(u32), 100_000);
+    defer testing.allocator.free(seen);
+    @memset(seen, .init(0));
+    var cursor: Cursor = .init(seen.len, 7);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Claimer.run, .{ &cursor, seen });
+    for (threads) |t| t.join();
+    for (seen) |*s| try testing.expectEqual(@as(u32, 1), s.load(.monotonic));
 }
 
 const Worked = struct {

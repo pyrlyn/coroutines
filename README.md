@@ -70,11 +70,13 @@ Full reference: [docs/API.md](docs/API.md).
 * `runAll(T, tasks, cancel)` — round-robin on the calling thread. Finished tasks are
   swapped to the end of the slice, so each round touches only live tasks.
 * `runParallel(T, tasks, opts)` — up to `max_threads` (64) workers including the caller.
-  Work distribution is one atomic cursor (`fetchAdd` of `chunk` tasks); a worker runs
+  Work distribution is one `Cursor` (`fetchAdd` of `chunk` tasks); a worker runs
   its chunk to completion and claims the next one. Thread handles live on the caller's
   stack. All threads are joined before returning, also on cancellation. Workers get
   `opts.stack_size` of stack; `opts.caller_works = false` leaves the caller waiting, so
   every step runs on such a stack. `currentWorker()` gives a step its worker's index.
+* `Cursor` — that queue on its own: hands out `[0, total)` in chunks to any number of
+  threads, for parallel loops over indices that are not coroutines.
 * Cancellation: an optional `*const std.atomic.Value(bool)`, checked between rounds;
   the run returns `error.Canceled` after all workers have stopped.
 * Limitation: a task that never yields blocks its worker; there is no preemption.

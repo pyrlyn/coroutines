@@ -12,6 +12,8 @@ Public surface (everything else is internal):
 | `coro.state_machine.runParallel` | fn | run tasks on N OS threads |
 | `coro.state_machine.ParallelOptions` | struct | `threads`, `chunk`, `cancel`, `stack_size`, `caller_works` |
 | `coro.state_machine.currentWorker` | fn | index of the `runParallel` worker running on this thread |
+| `coro.state_machine.Cursor` | struct | hands out `[0, total)` in chunks, lock-free |
+| `coro.state_machine.Range` | struct | `start`, `end`: what `Cursor.claim` returns |
 | `coro.state_machine.max_threads` | const | 64, upper bound for `threads` |
 | `coro.state_machine.worker_stack_size` | const | 1 MiB, default stack per worker thread |
 | `coro.io.spawnEach` | fn | spawn `n` tasks into a `std.Io.Group` |
@@ -57,7 +59,7 @@ const steps = try coro.state_machine.runAll(Countdown, &tasks, null); // 6
 
 Runs tasks on up to `opts.threads` threads, the calling thread included unless
 `opts.caller_works` is false. Workers claim
-chunks of `opts.chunk` tasks from one atomic cursor and run each chunk with `runAll`. Every
+chunks of `opts.chunk` tasks from one `Cursor` and run each chunk with `runAll`. Every
 task is stepped by exactly one thread, so its own fields need no locking; shared state does.
 All threads are joined before returning, also on cancellation. If the OS refuses a thread,
 the run continues with fewer workers.
@@ -82,6 +84,26 @@ try coro.state_machine.runParallel(Countdown, tasks, .{ .threads = 4, .cancel = 
 This thread's index in the innermost `runParallel` it is working in, in `0..opts.threads`,
 or `null` outside one. A calling thread that works is index 0. Use it to reach per-worker
 state from a `step`.
+
+### `Cursor`
+
+Hands out `[0, total)` in chunks, each index exactly once, to any number of threads, with
+one `fetchAdd` per claim. Use it for a parallel loop over indices that are not coroutines;
+`runParallel` is built on it.
+
+| method | meaning |
+|---|---|
+| `init(total: usize, chunk: usize) Cursor` | `chunk` is clamped to `1..total`; the fields are internal |
+| `claim(self: *Cursor) ?Range` | the next chunk, `null` when every index has been handed out |
+
+A claim synchronises nothing, so what the items need must be visible before the threads
+start.
+
+```zig
+var cursor: coro.state_machine.Cursor = .init(items.len, 64);
+// on every thread:
+while (cursor.claim()) |r| for (items[r.start..r.end]) |*item| process(item);
+```
 
 ## `io`
 
