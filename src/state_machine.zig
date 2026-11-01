@@ -132,7 +132,8 @@ pub const Cursor = struct {
     }
 };
 
-/// Runs tasks on up to `opts.threads` OS threads (including the caller's).
+/// Runs tasks on up to `opts.threads` OS threads (including the caller's),
+/// never more than there are chunks of `opts.chunk` tasks.
 ///
 /// Params: `T` and `tasks` as in `runAll`; `opts` see `ParallelOptions`.
 /// Returns when every task is done (or `error.Canceled`); all threads have
@@ -144,7 +145,9 @@ pub const Cursor = struct {
 /// ```
 /// Work distribution is a
 /// lock-free queue: one `Cursor` over `tasks`; each worker claims a chunk
-/// and runs it round-robin to completion, then claims the next. The
+/// and runs it round-robin to completion, then claims the next. Unlike
+/// `runAll`, tasks larger than two words in chunks of up to 1024 are not
+/// moved, so the slice keeps its order. The
 /// calling thread works too unless `opts.caller_works` is
 /// false. All spawned threads are joined before returning (deterministic
 /// shutdown), also on cancellation. If a thread cannot be spawned, the run
@@ -152,8 +155,10 @@ pub const Cursor = struct {
 pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!void {
     checkTask(T);
     const want = if (opts.threads == 0) (std.Thread.getCpuCount() catch 1) else opts.threads;
-    const n = @max(1, @min(want, max_threads));
     var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel };
+    // More workers than chunks would only spawn threads that find the queue empty.
+    const chunks = (tasks.len + shared.cursor.chunk - 1) / shared.cursor.chunk;
+    const n = @max(1, @min(want, max_threads, chunks));
     var handles: [max_threads]std.Thread = undefined;
     const first: usize = @intFromBool(opts.caller_works);
     var spawned: usize = 0;
@@ -165,6 +170,9 @@ pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!vo
     if (shared.canceled.load(.acquire)) return error.Canceled;
 }
 
+/// Largest chunk `runParallel` steps through an index array (2 KiB of stack).
+const max_indexed = 1024;
+
 fn Shared(comptime T: type) type {
     return struct {
         tasks: []T,
@@ -172,13 +180,39 @@ fn Shared(comptime T: type) type {
         cancel: ?*const std.atomic.Value(bool),
         canceled: std.atomic.Value(bool) = .init(false),
 
+        // Tasks bigger than two words are not moved: a finished task leaves the
+        // round by overwriting its u16 index instead of swapping the whole `T`.
+        const use_indexed = @sizeOf(T) > 2 * @sizeOf(usize);
+
+        /// `runAll` over at most `max_indexed` tasks without permuting them.
+        fn runIndexed(tasks: []T, cancel: ?*const std.atomic.Value(bool)) Error!u64 {
+            var idx: [max_indexed]u16 = undefined;
+            for (idx[0..tasks.len], 0..) |*x, i| x.* = @intCast(i);
+            var live = tasks.len;
+            var steps: u64 = 0;
+            while (live > 0) {
+                if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+                var i: usize = 0;
+                while (i < live) {
+                    steps += 1;
+                    if (tasks[idx[i]].step() == .done) {
+                        live -= 1;
+                        idx[i] = idx[live];
+                    } else i += 1;
+                }
+            }
+            return steps;
+        }
+
         fn worker(s: *@This(), index: usize) void {
             // A step may run `runParallel` itself; its worker must get this index back.
             const outer = current_worker;
             current_worker = index;
             defer current_worker = outer;
             while (s.cursor.claim()) |r| {
-                _ = runAll(T, s.tasks[r.start..r.end], s.cancel) catch {
+                const chunk = s.tasks[r.start..r.end];
+                const res = if (use_indexed and chunk.len <= max_indexed) runIndexed(chunk, s.cancel) else runAll(T, chunk, s.cancel);
+                _ = res catch {
                     s.canceled.store(true, .release);
                     return;
                 };

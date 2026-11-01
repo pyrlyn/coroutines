@@ -48,6 +48,23 @@ const SmTask = struct {
     }
 };
 
+/// `SmTask` with a 480-byte payload (sm-big): moving a task costs.
+const BigTask = struct {
+    acc: u64,
+    left: u8,
+    out: *std.atomic.Value(u64),
+    payload: [480]u8 = undefined,
+    pub fn step(t: *BigTask) sm.Step {
+        t.acc = sliceWork(t.acc);
+        t.left -= 1;
+        if (t.left == 0) {
+            _ = t.out.fetchAdd(t.acc, .monotonic);
+            return .done;
+        }
+        return .yield;
+    }
+};
+
 fn ioTask(out: *std.atomic.Value(u64), id: usize) Io.Cancelable!void {
     _ = out.fetchAdd(taskSequential(id), .monotonic);
 }
@@ -287,6 +304,16 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         r.children = usage(true);
         r.children.maxrss_kb = rss_sum;
+    } else if (std.mem.eql(u8, name, "sm-big")) {
+        // 504-byte tasks finishing at different rounds.
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const tasks = try ca.alloc(BigTask, n_tasks);
+        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = @intCast(1 + i % (2 * slices)), .out = &out };
+        try sm.runParallel(BigTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        r.ns = now(io) - t0;
+        ca.free(tasks);
+        r.check = out.load(.monotonic);
     } else {
         return error.UnknownVariant;
     }
