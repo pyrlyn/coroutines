@@ -130,6 +130,20 @@ pub const Cursor = struct {
         if (start >= c.total) return null;
         return .{ .start = start, .end = @min(start + c.chunk, c.total) };
     }
+
+    /// Like `claim`, but the chunk shrinks towards 1 as the queue drains:
+    /// `clamp(remaining / (2 * workers), 1, chunk)`. Early claims stay large
+    /// (few atomics); the last ones are small, so no worker is left holding a
+    /// big chunk while the others are idle. One `cmpxchg` loop per claim.
+    pub fn claimTapered(c: *Cursor, workers: usize) ?Range {
+        var start = c.next.load(.monotonic);
+        while (start < c.total) {
+            const size = std.math.clamp((c.total - start) / (2 * @max(1, workers)), 1, c.chunk);
+            start = c.next.cmpxchgWeak(start, start + size, .monotonic, .monotonic) orelse
+                return .{ .start = start, .end = start + size };
+        }
+        return null;
+    }
 };
 
 /// Runs tasks on up to `opts.threads` OS threads (including the caller's),
@@ -145,6 +159,7 @@ pub const Cursor = struct {
 /// ```
 /// Work distribution is a
 /// lock-free queue: one `Cursor` over `tasks`; each worker claims a chunk
+/// (`Cursor.claimTapered`: at most `opts.chunk`, smaller near the end)
 /// and runs it round-robin to completion, then claims the next. Unlike
 /// `runAll`, tasks larger than two words in chunks of up to 1024 are not
 /// moved, so the slice keeps its order. The
@@ -155,10 +170,11 @@ pub const Cursor = struct {
 pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!void {
     checkTask(T);
     const want = if (opts.threads == 0) (std.Thread.getCpuCount() catch 1) else opts.threads;
-    var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel };
+    var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel, .workers = 1 };
     // More workers than chunks would only spawn threads that find the queue empty.
     const chunks = (tasks.len + shared.cursor.chunk - 1) / shared.cursor.chunk;
     const n = @max(1, @min(want, max_threads, chunks));
+    shared.workers = n;
     var handles: [max_threads]std.Thread = undefined;
     const first: usize = @intFromBool(opts.caller_works);
     var spawned: usize = 0;
@@ -178,6 +194,7 @@ fn Shared(comptime T: type) type {
         tasks: []T,
         cursor: Cursor,
         cancel: ?*const std.atomic.Value(bool),
+        workers: usize,
         canceled: std.atomic.Value(bool) = .init(false),
 
         // Tasks bigger than two words are not moved: a finished task leaves the
@@ -209,7 +226,7 @@ fn Shared(comptime T: type) type {
             const outer = current_worker;
             current_worker = index;
             defer current_worker = outer;
-            while (s.cursor.claim()) |r| {
+            while (s.cursor.claimTapered(s.workers)) |r| {
                 const chunk = s.tasks[r.start..r.end];
                 const res = if (use_indexed and chunk.len <= max_indexed) runIndexed(chunk, s.cancel) else runAll(T, chunk, s.cancel);
                 _ = res catch {
@@ -429,4 +446,20 @@ test "cancellation stops all workers and joins them" {
     try testing.expectError(error.Canceled, runParallel(Forever, &tasks, .{ .threads = 3, .chunk = 256, .cancel = &cancel }));
     th.join();
     try testing.expectError(error.Canceled, runAll(Forever, &tasks, &cancel));
+}
+
+test "Cursor.claimTapered hands out every index once, shrinking to 1" {
+    var c: Cursor = .init(1000, 64);
+    var seen: [1000]bool = @splat(false);
+    var last: usize = 64;
+    while (c.claimTapered(4)) |r| {
+        try testing.expect(r.end > r.start and r.end - r.start <= 64);
+        last = r.end - r.start;
+        for (seen[r.start..r.end]) |*b| {
+            try testing.expect(!b.*);
+            b.* = true;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), last);
+    for (seen) |b| try testing.expect(b);
 }

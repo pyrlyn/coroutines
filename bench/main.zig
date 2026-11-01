@@ -69,6 +69,22 @@ const BigTask = struct {
     }
 };
 
+/// Like `SmTask`, but `left` fits long tasks (sm-skew).
+const SkewTask = struct {
+    acc: u64,
+    left: u16,
+    out: *std.atomic.Value(u64),
+    pub fn step(t: *SkewTask) sm.Step {
+        t.acc = sliceWork(t.acc);
+        t.left -= 1;
+        if (t.left == 0) {
+            _ = t.out.fetchAdd(t.acc, .monotonic);
+            return .done;
+        }
+        return .yield;
+    }
+};
+
 fn ioTask(out: *std.atomic.Value(u64), id: usize) Io.Cancelable!void {
     _ = out.fetchAdd(taskSequential(id), .monotonic);
 }
@@ -341,6 +357,16 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         const tasks = try ca.alloc(BigTask, n_tasks);
         for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = @intCast(1 + i % (2 * slices)), .out = &out };
         try sm.runParallel(BigTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        r.ns = now(io) - t0;
+        ca.free(tasks);
+        r.check = out.load(.monotonic);
+    } else if (std.mem.eql(u8, name, "sm-skew")) {
+        // Uneven work: every 97th task runs 64x longer than the rest.
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const tasks = try ca.alloc(SkewTask, n_tasks);
+        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = if (i % 97 == 0) slices * 64 else slices, .out = &out };
+        try sm.runParallel(SkewTask, tasks, .{ .threads = r.threads, .chunk = 256 });
         r.ns = now(io) - t0;
         ca.free(tasks);
         r.check = out.load(.monotonic);
