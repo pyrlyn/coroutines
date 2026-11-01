@@ -73,14 +73,30 @@ pub const ParallelOptions = struct {
     chunk: usize = 64,
     /// Cooperative cancellation flag, checked between rounds.
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// Stack size for spawned workers. The calling thread keeps its own stack.
+    stack_size: usize = worker_stack_size,
+    /// Whether the calling thread works too. With `false` it only waits and
+    /// all `threads` workers are spawned, so steps that need `stack_size` get
+    /// it even when the caller's stack is smaller. Should no thread spawn at
+    /// all, the caller works anyway: the tasks still have to run.
+    caller_works: bool = true,
 };
 
-/// Stack size for worker threads (steps run on it). 256 KiB fails with
-/// glibc on aarch64 Linux, so stay at 1 MiB.
+/// Default stack size for worker threads (steps run on it). 256 KiB fails
+/// with glibc on aarch64 Linux, so stay at 1 MiB.
 pub const worker_stack_size = 1024 * 1024;
 
 /// Hard cap on worker threads; their handles live on the caller's stack.
 pub const max_threads = 64;
+
+threadlocal var current_worker: ?usize = null;
+
+/// This thread's index in the innermost `runParallel` it is working in, in
+/// `0..opts.threads`, or `null` outside one. A step has no other way to reach
+/// per-worker state, such as an arena. A calling thread that works is index 0.
+pub fn currentWorker() ?usize {
+    return current_worker;
+}
 
 /// Runs tasks on up to `opts.threads` OS threads (including the caller's).
 ///
@@ -95,20 +111,22 @@ pub const max_threads = 64;
 /// Work distribution is a
 /// lock-free queue: one atomic cursor over `tasks`; each worker claims a
 /// chunk with `fetchAdd` and runs it round-robin to completion, then claims
-/// the next. The calling thread works too. All spawned threads are joined
-/// before returning (deterministic shutdown), also on cancellation. If a
-/// thread cannot be spawned, the run continues with fewer workers.
+/// the next. The calling thread works too unless `opts.caller_works` is
+/// false. All spawned threads are joined before returning (deterministic
+/// shutdown), also on cancellation. If a thread cannot be spawned, the run
+/// continues with fewer workers.
 pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!void {
     checkTask(T);
     const want = if (opts.threads == 0) (std.Thread.getCpuCount() catch 1) else opts.threads;
     const n = @max(1, @min(want, max_threads));
     var shared: Shared(T) = .{ .tasks = tasks, .chunk = @max(1, opts.chunk), .cancel = opts.cancel };
     var handles: [max_threads]std.Thread = undefined;
+    const first: usize = @intFromBool(opts.caller_works);
     var spawned: usize = 0;
-    while (spawned + 1 < n) : (spawned += 1) {
-        handles[spawned] = std.Thread.spawn(.{ .stack_size = worker_stack_size }, Shared(T).worker, .{&shared}) catch break;
+    while (spawned + first < n) : (spawned += 1) {
+        handles[spawned] = std.Thread.spawn(.{ .stack_size = opts.stack_size }, Shared(T).worker, .{ &shared, spawned + first }) catch break;
     }
-    shared.worker();
+    if (opts.caller_works or spawned == 0) shared.worker(0);
     for (handles[0..spawned]) |h| h.join();
     if (shared.canceled.load(.acquire)) return error.Canceled;
 }
@@ -121,7 +139,11 @@ fn Shared(comptime T: type) type {
         next: std.atomic.Value(usize) = .init(0),
         canceled: std.atomic.Value(bool) = .init(false),
 
-        fn worker(s: *@This()) void {
+        fn worker(s: *@This(), index: usize) void {
+            // A step may run `runParallel` itself; its worker must get this index back.
+            const outer = current_worker;
+            current_worker = index;
+            defer current_worker = outer;
             while (true) {
                 const start = s.next.fetchAdd(s.chunk, .monotonic);
                 if (start >= s.tasks.len) return;
@@ -206,6 +228,77 @@ test "runParallel uses several threads and completes all tasks" {
         }
     }
     if ((std.Thread.getCpuCount() catch 1) > 1) try testing.expect(distinct >= 2);
+}
+
+const Worked = struct {
+    worker: ?usize = null,
+    thread: std.Thread.Id = 0,
+
+    pub fn step(self: *Worked) Step {
+        self.worker = currentWorker();
+        self.thread = std.Thread.getCurrentId();
+        return .done;
+    }
+};
+
+test "currentWorker numbers the workers and is null outside a run" {
+    try testing.expectEqual(@as(?usize, null), currentWorker());
+    var tasks: [256]Worked = @splat(.{});
+    try runParallel(Worked, &tasks, .{ .threads = 4, .chunk = 1 });
+    for (tasks) |t| {
+        try testing.expect(t.worker.? < 4);
+        if (t.thread == std.Thread.getCurrentId()) try testing.expectEqual(@as(?usize, 0), t.worker);
+    }
+    try testing.expectEqual(@as(?usize, null), currentWorker());
+}
+
+test "without caller_works every step stays off the calling thread" {
+    var tasks: [256]Worked = @splat(.{});
+    try runParallel(Worked, &tasks, .{ .threads = 3, .chunk = 1, .caller_works = false });
+    for (tasks) |t| {
+        try testing.expect(t.worker.? < 3);
+        try testing.expect(t.thread != std.Thread.getCurrentId());
+    }
+}
+
+const Deep = struct {
+    reached: bool = false,
+
+    pub fn step(self: *Deep) Step {
+        var frame: [4 * worker_stack_size]u8 = undefined;
+        @memset(&frame, 1);
+        std.mem.doNotOptimizeAway(&frame);
+        self.reached = true;
+        return .done;
+    }
+};
+
+test "stack_size reaches the workers" {
+    var tasks: [8]Deep = @splat(.{});
+    try runParallel(Deep, &tasks, .{ .threads = 2, .chunk = 1, .stack_size = 8 * worker_stack_size, .caller_works = false });
+    for (tasks) |t| try testing.expect(t.reached);
+}
+
+const Nesting = struct {
+    before: ?usize = null,
+    after: ?usize = null,
+
+    pub fn step(self: *Nesting) Step {
+        self.before = currentWorker();
+        var inner: [8]Worked = @splat(.{});
+        runParallel(Worked, &inner, .{ .threads = 2, .chunk = 1 }) catch unreachable;
+        self.after = currentWorker();
+        return .done;
+    }
+};
+
+test "a nested run gives the outer worker its index back" {
+    var tasks: [8]Nesting = @splat(.{});
+    try runParallel(Nesting, &tasks, .{ .threads = 2, .chunk = 1 });
+    for (tasks) |t| {
+        try testing.expect(t.before != null);
+        try testing.expectEqual(t.before, t.after);
+    }
 }
 
 const Forever = struct {
