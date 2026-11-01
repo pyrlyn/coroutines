@@ -287,6 +287,16 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         r.children = usage(true);
         r.children.maxrss_kb = rss_sum;
+    } else if (std.mem.eql(u8, name, "sm-fine")) {
+        // sm-parallel with chunk = 1: one claim per task, the queue is hot.
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const tasks = try ca.alloc(SmTask, n_tasks);
+        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .out = &out };
+        try sm.runParallel(SmTask, tasks, .{ .threads = r.threads, .chunk = 1 });
+        r.ns = now(io) - t0;
+        ca.free(tasks);
+        r.check = out.load(.monotonic);
     } else {
         return error.UnknownVariant;
     }

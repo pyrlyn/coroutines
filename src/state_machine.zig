@@ -113,8 +113,10 @@ pub const Range = struct { start: usize, end: usize };
 /// while (cursor.claim()) |r| for (items[r.start..r.end]) |*item| process(item);
 /// ```
 pub const Cursor = struct {
-    next: std.atomic.Value(usize) = .init(0),
-    total: usize,
+    // `next` is written by every claim; `total` and `chunk` are read by every
+    // claim. Separate cache lines keep the readers from missing on each write.
+    next: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
+    total: usize align(std.atomic.cache_line),
     chunk: usize,
 
     /// `chunk` is clamped to `1..total`: a claim has to move the cursor, and a
