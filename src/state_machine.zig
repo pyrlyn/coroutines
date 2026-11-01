@@ -132,7 +132,8 @@ pub const Cursor = struct {
     }
 };
 
-/// Runs tasks on up to `opts.threads` OS threads (including the caller's).
+/// Runs tasks on up to `opts.threads` OS threads (including the caller's),
+/// never more than there are chunks of `opts.chunk` tasks.
 ///
 /// Params: `T` and `tasks` as in `runAll`; `opts` see `ParallelOptions`.
 /// Returns when every task is done (or `error.Canceled`); all threads have
@@ -152,8 +153,10 @@ pub const Cursor = struct {
 pub fn runParallel(comptime T: type, tasks: []T, opts: ParallelOptions) Error!void {
     checkTask(T);
     const want = if (opts.threads == 0) (std.Thread.getCpuCount() catch 1) else opts.threads;
-    const n = @max(1, @min(want, max_threads));
     var shared: Shared(T) = .{ .tasks = tasks, .cursor = .init(tasks.len, opts.chunk), .cancel = opts.cancel };
+    // More workers than chunks would only spawn threads that find the queue empty.
+    const chunks = (tasks.len + shared.cursor.chunk - 1) / shared.cursor.chunk;
+    const n = @max(1, @min(want, max_threads, chunks));
     var handles: [max_threads]std.Thread = undefined;
     const first: usize = @intFromBool(opts.caller_works);
     var spawned: usize = 0;
