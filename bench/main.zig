@@ -48,6 +48,10 @@ const SmTask = struct {
     }
 };
 
+fn dispatchHandle(out: *std.atomic.Value(u64), msg: u64) void {
+    _ = out.fetchAdd(sliceWork(msg) & 0xff, .monotonic);
+}
+
 /// `SmTask` with a 480-byte payload (sm-big): moving a task costs.
 const BigTask = struct {
     acc: u64,
@@ -304,6 +308,32 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         r.children = usage(true);
         r.children.maxrss_kb = rss_sum;
+    } else if (std.mem.eql(u8, name, "io-dispatch")) {
+        // 10 * N messages through a Dispatcher with one worker per CPU.
+        // Uses `submitMany` (batches of 64) when the library has it.
+        var threaded: Io.Threaded = .init(ca, .{});
+        defer threaded.deinit();
+        const tio = threaded.io();
+        r.threads = cpuCount();
+        const msgs = n_tasks * 10;
+        const D = coro.io.Dispatcher(u64, *std.atomic.Value(u64), dispatchHandle);
+        var qbuf: [256]u64 = undefined;
+        const t0 = now(io);
+        var d: D = .init(tio, &out, &qbuf);
+        try d.start(r.threads);
+        if (@hasDecl(D, "submitMany")) {
+            var batch: [64]u64 = undefined;
+            var i: usize = 0;
+            while (i < msgs) {
+                const k = @min(batch.len, msgs - i);
+                for (batch[0..k], 0..) |*m, j| m.* = i + j;
+                try d.submitMany(batch[0..k]);
+                i += k;
+            }
+        } else for (0..msgs) |i| try d.submit(i);
+        try d.shutdown();
+        r.ns = now(io) - t0;
+        r.ops = msgs;
     } else if (std.mem.eql(u8, name, "sm-big")) {
         // 504-byte tasks finishing at different rounds.
         r.threads = cpuCount();

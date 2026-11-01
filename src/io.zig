@@ -74,6 +74,8 @@ fn Block(comptime function: anytype, comptime Ctx: type) type {
 pub fn Dispatcher(comptime Msg: type, comptime Ctx: type, comptime handler: fn (Ctx, Msg) void) type {
     return struct {
         const Self = @This();
+        /// Most messages a worker takes from the queue at once.
+        pub const batch = 32;
 
         io: Io,
         ctx: Ctx,
@@ -98,17 +100,25 @@ pub fn Dispatcher(comptime Msg: type, comptime Ctx: type, comptime handler: fn (
         }
 
         fn worker(self: *Self) Io.Cancelable!void {
+            // Take up to `batch` messages per queue lock instead of one.
+            var buf: [batch]Msg = undefined;
             while (true) {
-                const msg = self.queue.getOne(self.io) catch |e| switch (e) {
+                const got = self.queue.get(self.io, &buf, 1) catch |e| switch (e) {
                     error.Closed => return,
                     error.Canceled => return error.Canceled,
                 };
-                handler(self.ctx, msg);
+                for (buf[0..got]) |msg| handler(self.ctx, msg);
             }
         }
 
         /// Enqueues a message, blocking (cooperatively) while the queue is full.
         /// Returns `error.Closed` after `shutdown`/`cancel`.
+        /// Enqueues all of `msgs`, blocking while the queue is full; one
+        /// queue lock per filled stretch instead of one per message.
+        pub fn submitMany(self: *Self, msgs: []const Msg) (Io.QueueClosedError || Io.Cancelable)!void {
+            try self.queue.putAll(self.io, msgs);
+        }
+
         pub fn submit(self: *Self, msg: Msg) (Io.QueueClosedError || Io.Cancelable)!void {
             try self.queue.putOne(self.io, msg);
         }
@@ -251,4 +261,19 @@ test "Dispatcher.cancel with blocked workers" {
 
 test "evented availability flag is comptime-known" {
     comptime std.debug.assert(@TypeOf(evented_available) == bool);
+}
+
+test "Dispatcher.submitMany delivers every message" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var sink: Sink = .{};
+    var buf: [16]u64 = undefined;
+    var d: Dispatcher(u64, *Sink, Sink.handle) = .init(threaded.io(), &sink, &buf);
+    try d.start(3);
+    var msgs: [1000]u64 = undefined;
+    for (&msgs, 0..) |*m, i| m.* = i;
+    try d.submitMany(&msgs);
+    try d.shutdown();
+    try testing.expectEqual(@as(usize, 1000), sink.count.load(.monotonic));
+    try testing.expectEqual(expectedSum(1000), sink.sum.load(.monotonic));
 }
