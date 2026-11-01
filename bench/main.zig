@@ -287,6 +287,25 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         r.children = usage(true);
         r.children.maxrss_kb = rss_sum;
+    } else if (std.mem.eql(u8, name, "sm-repeat")) {
+        // 500 back-to-back parallel runs of N tasks: per-run overhead dominates.
+        // Uses `Pool` when the library has it, else `runParallel` per run.
+        const rounds = 500;
+        const use_pool = @hasDecl(sm, "Pool");
+        r.threads = cpuCount();
+        const tasks = try ca.alloc(SmTask, n_tasks);
+        const t0 = now(io);
+        var pool: if (use_pool) sm.Pool else void = undefined;
+        if (use_pool) pool.init(io, .{ .threads = r.threads });
+        for (0..rounds) |_| {
+            for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .out = &out };
+            if (use_pool) try pool.run(SmTask, tasks, .{ .chunk = 256 }) else try sm.runParallel(SmTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        }
+        if (use_pool) pool.deinit();
+        r.ns = now(io) - t0;
+        ca.free(tasks);
+        r.ops = n_tasks * rounds;
+        r.check = out.load(.monotonic);
     } else {
         return error.UnknownVariant;
     }
