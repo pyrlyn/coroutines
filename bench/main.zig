@@ -488,10 +488,11 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
 
 fn emit(w: *Io.Writer, r: Result) !void {
     try w.print("{s} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
-        r.name,             r.ops,            r.ns,             r.allocs,         r.alloc_bytes,
-        r.threads,          r.procs,          r.spawn_ns,       r.check,          r.self.maxrss_kb,
-        r.self.minflt,      r.self.majflt,    r.self.nvcsw,     r.self.nivcsw,    r.children.maxrss_kb,
-        r.children.minflt,  r.children.nvcsw, r.children.nivcsw,  r.self.cpu_us,     r.children.cpu_us, r.wall_all_ns,
+        r.name,            r.ops,            r.ns,              r.allocs,      r.alloc_bytes,
+        r.threads,         r.procs,          r.spawn_ns,        r.check,       r.self.maxrss_kb,
+        r.self.minflt,     r.self.majflt,    r.self.nvcsw,      r.self.nivcsw, r.children.maxrss_kb,
+        r.children.minflt, r.children.nvcsw, r.children.nivcsw, r.self.cpu_us, r.children.cpu_us,
+        r.wall_all_ns,
     });
 }
 
@@ -507,8 +508,16 @@ fn parse(line: []const u8, name_buf: []u8) !Result {
         }
     }.f;
     return .{
-        .name = name_buf[0..name.len], .ops = u(v[0]), .ns = @intCast(v[1]), .allocs = u(v[2]), .alloc_bytes = u(v[3]),
-        .wall_all_ns = @intCast(v[19]), .threads = @intCast(v[4]), .procs = @intCast(v[5]), .spawn_ns = @intCast(v[6]), .check = u(v[7]),
+        .name = name_buf[0..name.len],
+        .ops = u(v[0]),
+        .ns = @intCast(v[1]),
+        .allocs = u(v[2]),
+        .alloc_bytes = u(v[3]),
+        .wall_all_ns = @intCast(v[19]),
+        .threads = @intCast(v[4]),
+        .procs = @intCast(v[5]),
+        .spawn_ns = @intCast(v[6]),
+        .check = u(v[7]),
         .self = .{ .maxrss_kb = u(v[8]), .minflt = u(v[9]), .majflt = u(v[10]), .nvcsw = u(v[11]), .nivcsw = u(v[12]), .cpu_us = u(v[17]) },
         .children = .{ .maxrss_kb = u(v[13]), .minflt = u(v[14]), .nvcsw = u(v[15]), .nivcsw = u(v[16]), .cpu_us = u(v[18]) },
     };
