@@ -554,3 +554,29 @@ test "over-aligned tasks: frames are recycled by base address" {
         }
     }.f);
 }
+
+test "docs/rt.md example" {
+    const Double = struct {
+        pub const Output = u64;
+        v: u64,
+        pub fn poll(self: *@This(), cx: *rt.Context) rt.Poll(u64) {
+            _ = cx;
+            return .{ .ready = self.v * 2 };
+        }
+    };
+    const Parent = struct {
+        pub const Output = u64;
+        h: ?rt.JoinHandle(Double) = null,
+        pub fn poll(self: *@This(), cx: *rt.Context) rt.Poll(u64) {
+            if (self.h == null) self.h = cx.runtime().spawn(Double, .{ .v = 21 }) catch @panic("oom");
+            return switch (self.h.?.poll(cx)) {
+                .pending => .pending,
+                .ready => |r| .{ .ready = r catch 0 },
+            };
+        }
+    };
+    var r: rt.Runtime = undefined;
+    try r.init(testing.allocator, testing.io, .{});
+    defer r.deinit();
+    try testing.expectEqual(@as(u64, 42), try r.blockOn(Parent, .{}));
+}

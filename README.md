@@ -6,6 +6,7 @@ Two coroutine flavours for Zig 0.17.1, plus an evented runtime. Standard library
 |---|---|---|---|---|
 | `coroutines.state_machine` | a struct with a state field and `pub fn step(*T) Step` (`.yield` / `.done`) | a function return + call | `@sizeOf(T)`, caller-provided storage, 0 allocations | `runParallel`: N OS threads, lock-free chunked work queue |
 | `coroutines.io` | a function run through `std.Io` (`Io.Group`, `Io.Queue`) | whatever the `Io` does (thread handoff for `std.Io.Threaded`) | one allocation per task in `std.Io.Threaded` (64 B measured) | the `Io` thread pool |
+| `coroutines.rt` | a struct with `Output` and `pub fn poll(*T, *rt.Context) rt.Poll(Output)`; waits (join, channel, semaphore) without a thread | a function return + call; wake-ups go to the worker's LIFO slot | one pooled 64 B+ frame, 0 allocations in steady state | own work-stealing pool (see [docs/rt.md](docs/rt.md)) |
 
 ## Using in your project
 
