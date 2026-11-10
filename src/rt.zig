@@ -36,6 +36,19 @@ const queue_mod = @import("rt/queue.zig");
 pub const sync = @import("rt/sync.zig");
 pub const Channel = sync.Channel;
 pub const Semaphore = sync.Semaphore;
+pub const driver_mod = @import("rt/driver.zig");
+pub const Timer = driver_mod.Timer;
+pub const IoSource = driver_mod.IoSource;
+pub const Blocking = driver_mod.Blocking;
+pub const FileRead = driver_mod.FileRead;
+pub const reactor_available = driver_mod.reactor_available;
+const seq_mod = @import("rt/seq.zig");
+pub const Flow = seq_mod.Flow;
+pub const Seq = seq_mod.Seq;
+pub const Race = seq_mod.Race;
+pub const All = seq_mod.All;
+pub const into = seq_mod.into;
+pub const Sleep = seq_mod.Sleep;
 
 /// Result of one `poll`.
 pub fn Poll(comptime T: type) type {
@@ -252,6 +265,26 @@ pub fn JoinHandle(comptime T: type) type {
             return .pending;
         }
 
+        /// `poll` that gives up at `deadline` (see `Runtime.now`) with
+        /// `error.Timeout`; the handle stays valid and the task keeps running.
+        pub fn pollDeadline(self: *Self, cx: *Context, t: *Timer, deadline: u64) Poll(error{Timeout}!Result(T)) {
+            switch (self.poll(cx)) {
+                .ready => |r| {
+                    _ = t.cancel();
+                    return .{ .ready = r };
+                },
+                .pending => {},
+            }
+            if (t.sleepUntil(cx, deadline) == .pending) return .pending;
+            const h = self.header.?;
+            if (h.join_waker.cmpxchgStrong(@intFromPtr(cx.header), join_none, .acq_rel, .acquire)) |actual| {
+                std.debug.assert(actual == join_done);
+                return .{ .ready = self.take() };
+            }
+            _ = cx.header.refs.fetchSub(1, .monotonic); // running: not the last ref
+            return .{ .ready = error.Timeout };
+        }
+
         /// Non-blocking check; null while running.
         pub fn tryResult(self: *Self) ?Result(T) {
             const h = self.header.?;
@@ -336,7 +369,7 @@ const Injector = struct {
     tail: ?*Header = null,
     len: std.atomic.Value(usize) = .init(0),
 
-    fn pushBatch(inj: *Injector, io: Io, first: *Header, last: *Header, count: usize) void {
+    pub fn pushBatch(inj: *Injector, io: Io, first: *Header, last: *Header, count: usize) void {
         _ = io;
         last.next = null;
         inj.lock.lock();
@@ -386,10 +419,13 @@ const Worker = struct {
     queue: LocalQueue = .{},
     rt: *Runtime align(cache_line),
     index: u32,
-    lifo: ?*Header = null,
+    /// Runs next. Atomic only so the monitor can take it from a stuck worker.
+    lifo: std.atomic.Value(?*Header) = .init(null),
     lifo_streak: u8 = 0,
     searching: bool = false,
     polling: bool = false,
+    /// Odd while a task is being polled (read by the monitor).
+    poll_seq: std.atomic.Value(u32) = .init(0),
     tick: u32 = 0,
     rng: u64,
     free: [n_classes]FreeList = @splat(.{}),
@@ -416,6 +452,9 @@ pub const Options = struct {
     stack_size: usize = 1024 * 1024,
     /// Spin rounds an idle worker makes before parking.
     spin_rounds: u32 = 64,
+    /// How often the driver checks for a worker stuck in one long poll while
+    /// holding tasks nobody else can see (0 = never). Multi-thread only.
+    monitor_interval_ns: u64 = std.time.ns_per_ms,
 };
 
 pub const max_lifo_streak = 3;
@@ -438,6 +477,7 @@ pub const Runtime = struct {
     slabs: ?*Slab = null,
     /// Live task frames (debug builds only; for leak checks).
     live: std.atomic.Value(usize) = .init(0),
+    drv: driver_mod.Driver = undefined,
 
     const track_live = std.debug.runtime_safety;
 
@@ -446,6 +486,7 @@ pub const Runtime = struct {
     pub fn init(r: *Runtime, gpa: Allocator, io: Io, opts: Options) !void {
         const n: usize = if (opts.current_thread) 1 else if (opts.workers == 0) (std.Thread.getCpuCount() catch 1) else opts.workers;
         r.* = .{ .gpa = gpa, .io = io, .opts = opts, .workers = &.{}, .threads = &.{} };
+        r.drv.init(r);
         r.workers = try gpa.alignedAlloc(Worker, .fromByteUnits(cache_line), n);
         errdefer gpa.free(r.workers);
         for (r.workers, 0..) |*w, i| w.* = .{ .rt = r, .index = @intCast(i), .rng = (0x9E3779B97F4A7C15 ^ (i *% 0xBF58476D1CE4E5B9)) | 1 };
@@ -455,6 +496,8 @@ pub const Runtime = struct {
         errdefer gpa.free(r.idle.is_idle);
         @memset(r.idle.is_idle, false);
         if (opts.current_thread) return;
+        if (n > 1 and opts.monitor_interval_ns > 0) try r.drv.ensureStarted();
+        errdefer r.drv.deinit();
         r.threads = try gpa.alloc(std.Thread, n);
         var started: usize = 0;
         errdefer {
@@ -470,6 +513,7 @@ pub const Runtime = struct {
     /// Stops and joins the workers and frees all memory. Tasks still
     /// pending are dropped without running `deinit`.
     pub fn deinit(r: *Runtime) void {
+        r.drv.deinit();
         r.shutdown();
         for (r.threads) |t| t.join();
         if (r.threads.len > 0) r.gpa.free(r.threads);
@@ -489,6 +533,26 @@ pub const Runtime = struct {
             w.park_word.store(1, .release);
             r.io.futexWake(u32, &w.park_word.raw, 1);
         }
+    }
+
+    /// The driver (timers, reactor, blocking pool, monitor).
+    pub fn driver(r: *Runtime) *driver_mod.Driver {
+        return &r.drv;
+    }
+
+    /// Nanoseconds on the monotonic clock used by timers.
+    pub fn now(r: *Runtime) u64 {
+        return driver_mod.nowNs(r.io);
+    }
+
+    /// Whether some worker is not parked.
+    pub fn anyWorkerAwake(r: *Runtime) bool {
+        return r.idle.num_idle.load(.monotonic) < r.workers.len;
+    }
+
+    /// Times the monitor made a stuck worker's private tasks stealable.
+    pub fn monitorRescues(r: *Runtime) usize {
+        return r.drv.rescued.load(.monotonic);
     }
 
     /// Number of task frames alive (debug builds; 0 in release).
@@ -549,12 +613,14 @@ pub const Runtime = struct {
         if (tl_worker) |w| if (w.rt == r) {
             if (kind == .wake and w.polling) {
                 // Run next on this core. A displaced task becomes stealable.
-                if (w.lifo) |prev| {
-                    w.lifo = h;
+                if (w.lifo.load(.monotonic) == null) {
+                    // Only this worker fills the slot: a plain store is enough.
+                    w.lifo.store(h, .release);
+                } else if (w.lifo.swap(h, .acq_rel)) |prev| {
                     w.queue.push(prev, r, overflowToInjector);
                     w.queue.publish();
                     r.notifyParked();
-                } else w.lifo = h;
+                }
                 return;
             }
             w.queue.push(h, r, overflowToInjector);
@@ -682,7 +748,10 @@ pub const Runtime = struct {
             if (r.idle.searching.fetchSub(1, .seq_cst) == 1) r.notifyParked();
         }
         w.polling = true;
+        const seq = w.poll_seq.raw;
+        w.poll_seq.store(seq +% 1, .monotonic);
         t.vtable.run(t);
+        w.poll_seq.store(seq +% 2, .monotonic);
         w.polling = false;
         if (w.queue.unpublished() != 0) {
             w.queue.publish();
@@ -695,14 +764,13 @@ pub const Runtime = struct {
         if (w.tick % injector_check_interval == 0) {
             if (r.takeInjector(w)) |t| return t;
         }
-        if (w.lifo) |t| {
-            w.lifo = null;
+        if (w.lifo.load(.monotonic) != null) if (w.lifo.swap(null, .acquire)) |t| {
             if (w.lifo_streak < max_lifo_streak) {
                 w.lifo_streak += 1;
                 return t;
             }
             w.queue.push(t, r, overflowToInjector);
-        }
+        };
         w.lifo_streak = 0;
         if (w.queue.pop()) |t| {
             if (w.queue.ownerLen() != 0) {
@@ -776,6 +844,7 @@ pub const Runtime = struct {
         }
         // The notifier counted us as searching.
         if (!r.shutdown_flag.load(.acquire)) w.searching = true;
+        r.drv.workerBusy();
     }
 
     /// Removes `w` from the idle set if it is still there.
@@ -794,7 +863,7 @@ pub const Runtime = struct {
     }
 
     /// Wakes one parked worker as a searcher, unless one already searches.
-    fn notifyParked(r: *Runtime) void {
+    pub fn notifyParked(r: *Runtime) void {
         if (r.idle.searching.load(.seq_cst) != 0) return;
         if (r.idle.num_idle.load(.seq_cst) == 0) return;
         r.idle.mutex.lockUncancelable(r.io);
@@ -817,5 +886,7 @@ pub const Runtime = struct {
 test {
     _ = queue_mod;
     _ = sync;
+    _ = driver_mod;
+    _ = seq_mod;
     _ = @import("rt/tests.zig");
 }

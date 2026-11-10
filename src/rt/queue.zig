@@ -26,8 +26,10 @@ pub fn LocalQueue(comptime Node: type) type {
         head: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
         /// Published tail (what thieves see).
         tail: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
-        /// Owner-only: real tail and a lower bound of `steal`.
-        ptail: u32 align(std.atomic.cache_line) = 0,
+        /// Real tail. Written by the owner only (release, so the runtime's
+        /// monitor may publish it for a stuck owner, see `publishRemote`).
+        ptail: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+        /// Owner-only: a lower bound of `steal`.
         cached_steal: u32 = 0,
         buf: [capacity]std.atomic.Value(?*Node) align(std.atomic.cache_line) = @splat(.init(null)),
 
@@ -55,30 +57,42 @@ pub fn LocalQueue(comptime Node: type) type {
 
         /// Owner only: all tasks, published or not.
         pub fn ownerLen(q: *const Self) u32 {
-            return q.ptail -% realOf(q.head.load(.monotonic));
+            return q.ptail.raw -% realOf(q.head.load(.monotonic));
         }
 
         /// Owner only: tasks pushed since the last `publish`.
         pub fn unpublished(q: *const Self) u32 {
-            return q.ptail -% q.tail.raw;
+            return q.ptail.raw -% q.tail.load(.monotonic);
         }
 
         /// Owner only: makes every pushed task visible to thieves.
         pub fn publish(q: *Self) void {
             // seq_cst: pairs with the seq_cst loads of an idle worker
             // re-checking queues before it parks (no lost wake-up).
-            if (q.tail.raw != q.ptail) q.tail.store(q.ptail, .seq_cst);
+            if (q.tail.load(.monotonic) != q.ptail.raw) q.tail.store(q.ptail.raw, .seq_cst);
+        }
+
+        /// Any thread: publishes the owner's tail while the owner is stuck in
+        /// a long poll. Never moves `tail` backwards, so it may race with
+        /// the owner's own `publish`. Returns true if it published anything.
+        pub fn publishRemote(q: *Self) bool {
+            const p = q.ptail.load(.acquire);
+            var t = q.tail.load(.monotonic);
+            while (@as(i32, @bitCast(p -% t)) > 0) {
+                t = q.tail.cmpxchgWeak(t, p, .seq_cst, .monotonic) orelse return true;
+            }
+            return false;
         }
 
         /// Owner only. Pushes `n` at the tail (unpublished); on overflow,
         /// calls `overflow(ctx, first, last, count)` with a linked batch (via
         /// `next`) of half the ring plus `n`.
         pub fn push(q: *Self, n: *Node, ctx: anytype, comptime overflow: fn (@TypeOf(ctx), *Node, *Node, usize) void) void {
-            const t = q.ptail;
+            const t = q.ptail.raw;
             if (t -% q.cached_steal < capacity) {
                 @branchHint(.likely);
                 q.buf[t & mask].store(n, .monotonic);
-                q.ptail = t +% 1;
+                q.ptail.store(t +% 1, .release);
                 return;
             }
             while (true) {
@@ -88,7 +102,7 @@ pub fn LocalQueue(comptime Node: type) type {
                 q.cached_steal = steal;
                 if (t -% steal < capacity) {
                     q.buf[t & mask].store(n, .monotonic);
-                    q.ptail = t +% 1;
+                    q.ptail.store(t +% 1, .release);
                     return;
                 }
                 q.publish();
@@ -122,7 +136,7 @@ pub fn LocalQueue(comptime Node: type) type {
             while (true) {
                 const steal = stealOf(h);
                 const real = realOf(h);
-                if (real == q.ptail) return null;
+                if (real == q.ptail.raw) return null;
                 const next_real = real +% 1;
                 const nh = if (steal == real) pack(next_real, next_real) else pack(steal, next_real);
                 if (q.head.cmpxchgWeak(h, nh, .acq_rel, .acquire)) |actual| {
@@ -137,7 +151,7 @@ pub fn LocalQueue(comptime Node: type) type {
         /// Moves half of `src` (rounded up) into `dst` and returns one of the
         /// stolen tasks to run right away, or null.
         pub fn stealInto(src: *Self, dst: *Self) ?*Node {
-            const dst_tail = dst.ptail;
+            const dst_tail = dst.ptail.raw;
             const dst_steal = stealOf(dst.head.load(.acquire));
             dst.cached_steal = dst_steal;
             if (dst_tail -% dst_steal > capacity / 2) return null;
@@ -180,7 +194,7 @@ pub fn LocalQueue(comptime Node: type) type {
             n -= 1;
             const ret = dst.buf[(dst_tail +% n) & mask].load(.monotonic);
             if (n > 0) {
-                dst.ptail = dst_tail +% n;
+                dst.ptail.store(dst_tail +% n, .release);
                 dst.publish();
             }
             return ret;

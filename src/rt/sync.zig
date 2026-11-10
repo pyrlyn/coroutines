@@ -11,6 +11,7 @@ const rt = @import("../rt.zig");
 const Context = rt.Context;
 const Header = rt.Header;
 const Poll = rt.Poll;
+const Timer = @import("driver.zig").Timer;
 
 /// Short critical sections only: spin, then yield the thread.
 pub const SpinLock = struct {
@@ -192,6 +193,60 @@ pub fn Channel(comptime T: type) type {
             return .pending;
         }
 
+        /// `recv` that gives up at `deadline` (see `Runtime.now`) with
+        /// `error.Timeout`. `t` is the task's timer, used for this wait only.
+        pub fn recvDeadline(c: *Self, cx: *Context, w: *RecvWaiter, t: *Timer, deadline: u64) Poll(error{Timeout}!?T) {
+            switch (c.recv(cx, w)) {
+                .ready => |v| {
+                    _ = t.cancel();
+                    return .{ .ready = v };
+                },
+                .pending => {},
+            }
+            if (t.sleepUntil(cx, deadline) == .pending) return .pending;
+            c.lock.lock();
+            defer c.lock.unlock();
+            const st = w.state;
+            w.state = .idle;
+            return .{
+                .ready = switch (st) {
+                    .waiting => blk: {
+                        c.receivers.remove(w);
+                        break :blk error.Timeout;
+                    },
+                    .done => w.value, // delivered just in time
+                    .closed => null,
+                    .idle => error.Timeout,
+                },
+            };
+        }
+
+        /// `send` that gives up at `deadline` with `error.Timeout` (the
+        /// value is then not sent).
+        pub fn sendDeadline(c: *Self, cx: *Context, w: *SendWaiter, v: T, t: *Timer, deadline: u64) Poll(error{ Closed, Timeout }!void) {
+            switch (c.send(cx, w, v)) {
+                .ready => |r| {
+                    _ = t.cancel();
+                    return .{ .ready = r };
+                },
+                .pending => {},
+            }
+            if (t.sleepUntil(cx, deadline) == .pending) return .pending;
+            c.lock.lock();
+            defer c.lock.unlock();
+            const st = w.state;
+            w.state = .idle;
+            return .{ .ready = switch (st) {
+                .waiting => blk: {
+                    c.senders.remove(w);
+                    break :blk error.Timeout;
+                },
+                .done => {},
+                .closed => error.Closed,
+                .idle => error.Timeout,
+            } };
+        }
+
         /// Never waits. `error.Full` when there is neither room nor a receiver.
         pub fn trySend(c: *Self, v: T) error{ Closed, Full }!void {
             c.lock.lock();
@@ -336,6 +391,24 @@ pub const Semaphore = struct {
         w.state = .waiting;
         s.waiters.pushBack(w);
         return .pending;
+    }
+
+    /// `acquire` that gives up at `deadline` with `error.Timeout`.
+    pub fn acquireDeadline(s: *Semaphore, cx: *Context, w: *Waiter, t: *Timer, deadline: u64) Poll(error{Timeout}!void) {
+        if (s.acquire(cx, w) == .ready) {
+            _ = t.cancel();
+            return .{ .ready = {} };
+        }
+        if (t.sleepUntil(cx, deadline) == .pending) return .pending;
+        s.lock.lock();
+        defer s.lock.unlock();
+        const st = w.state;
+        w.state = .idle;
+        if (st == .waiting) {
+            s.waiters.remove(w);
+            return .{ .ready = error.Timeout };
+        }
+        return .{ .ready = if (st == .done) {} else error.Timeout };
     }
 
     pub fn tryAcquire(s: *Semaphore) bool {
