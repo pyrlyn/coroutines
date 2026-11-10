@@ -52,6 +52,8 @@ afterwards; 64 B frames), tokio 1.0 (128–153 B), Go 2.0 (40–72 B).
 * Fan-out / fan-in on 16 threads is the noisiest row (132–216 ns): 200k senders
   contend on one channel lock.
 * tokio and Go tasks are `async` functions/goroutines; `rt` tasks are
-  hand-written state machines (Zig 0.17 has no async). `rt` has no timers or
-  I/O reactor yet.
+  hand-written state machines (Zig 0.17 has no async), or `rt.Seq` in phase 2.
+  Phase 2 adds timers, a kqueue/epoll reactor and a blocking pool; see
+  [`rt-vs-tokio-go-darwin-arm64-phase2.md`](rt-vs-tokio-go-darwin-arm64-phase2.md)
+  and [`rt-vs-tokio-go-linux-aarch64.md`](rt-vs-tokio-go-linux-aarch64.md).
 * "before" fan-in: every blocked sender holds an OS thread on `Io.Threaded`.
