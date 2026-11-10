@@ -9,6 +9,9 @@
 //! * `io` — coroutines on `std.Io`: `spawnEach` (many tasks into an
 //!   `Io.Group`), `Dispatcher` (worker pool over a bounded `Io.Queue`),
 //!   `evented_available`.
+//! * `evented` — a runtime that owns an evented `Io` (io_uring on Linux,
+//!   libdispatch on macOS): `Runtime`, `Scope` (structured, first error
+//!   cancels siblings), `Channel` (bounded, backpressure), `Limiter`.
 //!
 //! The "processes" variant in the benchmarks is benchmark code
 //! (`bench/main.zig`), not part of the library API.
@@ -17,10 +20,14 @@
 pub const state_machine = @import("state_machine.zig");
 /// Coroutines on top of `std.Io`.
 pub const io = @import("io.zig");
+/// Evented runtime: fibers on io_uring / libdispatch, structured scopes,
+/// bounded channels and a concurrency limiter.
+pub const evented = @import("evented.zig");
 
 test {
     _ = state_machine;
     _ = io;
+    _ = evented;
 }
 
 // Keeps the examples in README.md / docs/API.md compiling.

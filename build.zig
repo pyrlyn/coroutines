@@ -14,17 +14,18 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
-    // Benchmarks are always ReleaseFast.
+    // Benchmarks are ReleaseFast unless -Dbench-optimize says otherwise.
+    const bench_optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "Optimization mode of the bench binary (default ReleaseFast)") orelse std.builtin.OptimizeMode.ReleaseFast;
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
         .link_libc = target.result.os.tag != .windows,
     });
     bench_mod.addImport("coroutines", b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
     }));
     const bench_exe = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
     b.installArtifact(bench_exe);
