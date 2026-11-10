@@ -49,14 +49,15 @@ const v = try r.blockOn(Parent, .{}); // 42
   the task is aborted. A task that can be aborted while waiting must withdraw
   its waiters there (`Channel.cancelRecv` / `cancelSend`, `Semaphore.cancel`).
 * Zig has no `async` functions in 0.17, so a task keeps its progress in its own
-  fields; the runtime never allocates a stack.
+  fields; the runtime never allocates a stack. `rt.Seq` (below) writes the
+  state machine for you from a list of steps.
 
 ## API
 
 | item | what it does |
 |---|---|
 | `Runtime.init(*Runtime, gpa, io, Options)` / `deinit` | start / stop the workers; `gpa` must be thread-safe; the runtime must not move |
-| `Options` | `workers` (0 = CPUs), `current_thread` (no threads; `blockOn` drives the scheduler), `stack_size`, `spin_rounds` |
+| `Options` | `workers` (0 = CPUs), `current_thread` (no threads; `blockOn` drives the scheduler), `stack_size`, `spin_rounds`, `monitor_interval_ns` (stuck-worker check, default 1 ms, 0 = off) |
 | `Runtime.blockOn(T, task) !T.Output` | run a root task to completion from a plain thread |
 | `Runtime.spawn(T, task) !JoinHandle(T)` / `spawnDetached` | spawn from anywhere (a task of this runtime: its worker's queue; elsewhere: the injector) |
 | `JoinHandle(T).poll(cx)` | wait for the result (`error.Canceled` after `abort`); `tryResult`, `isFinished`, `abort`, `deinit` (detach) |
@@ -65,10 +66,111 @@ const v = try r.blockOn(Parent, .{}); // 42
 | `Channel(T)` | bounded MPMC over caller storage (`buf.len == 0` = rendezvous): `send`, `recv`, `trySend`, `tryRecv`, `close`, `cancelSend`, `cancelRecv` |
 | `Semaphore` | FIFO counting semaphore (concurrency limits, backpressure): `acquire`, `tryAcquire`, `release`, `cancel` |
 | `Runtime.liveTasks()` | live task frames (debug builds; for leak checks) |
+| `Runtime.now()` | ns on the monotonic clock that timers use |
+| `Timer` | one-shot timer embedded in a task: `sleepUntil(cx, deadline)`, `sleep(cx, ns)`, `cancel`, `isArmed` |
+| `Sleep` | a task that is ready after `ns` (`Sleep.init(ns)`) |
+| `Channel.recvDeadline` / `sendDeadline`, `Semaphore.acquireDeadline`, `JoinHandle.pollDeadline` | the same waits with a deadline; `error.Timeout` when it passes (a join that times out leaves the task running and the handle valid) |
+| `IoSource` | readiness I/O on a non-blocking fd (sockets, pipes, ttys): `register`, `read`, `write`, `readable`, `writable`, `cancelWaits`, `deregister` |
+| `Blocking(Ctx, Out, func)` / `FileRead` | run a blocking call on the blocking pool; `FileRead` is `pread` of a regular file |
+| `Seq(Ctx)` | a task from a list of steps (`Ctx.steps`), each returning a `Flow`: `.pending`, `.next`, `.{ .jump = i }`, `.done`; `rt.into` stores a ready value |
+| `Race(A, B)` / `All(A, B)` | run two tasks inside one task: first to finish (the loser's `deinit` runs) / both |
+| `Runtime.monitorRescues()` | how often the monitor made a stuck worker's tasks stealable |
 
 `Channel.send` / `recv` and `Semaphore.acquire` take a waiter that lives in the
 task (`Channel(T).SendWaiter`, `RecvWaiter`, `Semaphore.Waiter`); pass the same
 one on every poll until the call is ready. Waiting allocates nothing.
+
+### Timers, I/O and blocking work
+
+```zig
+const WithTimeout = struct {
+    pub const Output = error{Timeout}!?u32;
+    ch: *rt.Channel(u32),
+    w: rt.Channel(u32).RecvWaiter = .{},
+    t: rt.Timer = .{},
+    deadline: u64 = 0,
+    pub fn poll(self: *WithTimeout, cx: *rt.Context) rt.Poll(Output) {
+        if (self.deadline == 0) self.deadline = cx.runtime().now() + 50 * std.time.ns_per_ms;
+        return self.ch.recvDeadline(cx, &self.w, &self.t, self.deadline);
+    }
+    pub fn deinit(self: *WithTimeout) void { // when aborted
+        _ = self.t.cancel();
+        self.ch.cancelRecv(&self.w);
+    }
+};
+```
+
+* **Driver thread.** Each runtime has one driver thread, which multi-thread
+  runtimes start in `init`. A `current_thread` runtime starts it on the first
+  timer or `IoSource`. The driver owns the timers and the OS poller. It wakes
+  tasks through the normal wake path: injector, then a parked worker.
+* **Timers** are intrusive nodes of a pairing heap. Arming one allocates
+  nothing, and the earliest deadline is exact. The driver sleeps in the poller
+  until that deadline. Nothing busy-waits. A new earlier deadline pokes it.
+  Precision is that of the OS sleep: about 1 ms on Linux with `epoll`, finer
+  with `kqueue`.
+* **Reactor.** `kqueue` on macOS and the BSDs (with `EVFILT_USER` to poke).
+  `epoll`, edge-triggered, on Linux (with an `eventfd`). `IoSource.read` and
+  `write` try the syscall first and wait for readiness only on `WouldBlock`.
+  **Windows has no reactor yet** (no IOCP): `IoSource.register` returns
+  `error.Unsupported`, while timers and the blocking pool work.
+  **io_uring is not used.** It would add a completion-based path next to the
+  readiness one, so readiness is shared by both Unix OSes.
+* **Files.** Regular files are always "ready" to `kqueue` and `epoll`, so
+  readiness cannot make them asynchronous. `FileRead` (and any
+  `Blocking(Ctx, Out, func)`) runs the call on a lazily started blocking pool
+  of up to 16 threads and wakes the task when it returns. This is a thread
+  doing a blocking `pread`, not asynchronous file I/O. `Runtime.deinit` waits
+  for running operations.
+* **Monitor.** While some worker is awake, the driver checks every
+  `monitor_interval_ns`. A worker can stay inside the same poll since the last
+  check while it holds tasks nobody else can see: its LIFO slot, or tasks it
+  pushed but has not published yet. The driver then moves the LIFO task to the
+  injector, publishes the queue tail for the worker, and wakes a parked worker
+  to steal them. This is what tokio does not do (its LIFO slot stays local)
+  and what Go's sysmon does, minus preemption. Cost on the hot path: a
+  counter store before and after every poll, and an atomic swap to take the
+  LIFO slot.
+
+### `Seq`, `Race`, `All`
+
+```zig
+const PingPong = rt.Seq(struct {
+    pub const Output = u64;
+    pub const steps = .{ send, recv };
+    to: *rt.Channel(u64), from: *rt.Channel(u64), n: u64, i: u64 = 0, got: ?u64 = null,
+    sw: rt.Channel(u64).SendWaiter = .{}, rw: rt.Channel(u64).RecvWaiter = .{},
+    const C = @This();
+    pub fn output(c: *C) u64 { return c.i; }
+    fn send(c: *C, cx: *rt.Context) rt.Flow {
+        if (c.i == c.n) return .done;
+        return if (c.to.send(cx, &c.sw, c.i) == .pending) .pending else .next;
+    }
+    fn recv(c: *C, cx: *rt.Context) rt.Flow {
+        if (rt.into(?u64, c.from.recv(cx, &c.rw), &c.got) == .pending) return .pending;
+        c.i += 1;
+        return .{ .jump = 0 };
+    }
+});
+// r.blockOn(PingPong, .init(.{ .to = &a, .from = &b, .n = 1000 }))
+```
+
+`Seq` dispatches with an `inline` switch over the step index. Each step is a
+direct call that the compiler can inline, so the code is the same as a
+hand-written `switch (state)`. There is no function pointer and no allocation,
+and the frame grows by one byte. The benchmarks run spawn + join and ping-pong
+both ways: `spawnjoin1seq_*` and `pingpongseq_*`. The trade-off is the one
+every stackless design has. A value that must survive a wait lives in the
+context struct, not in a local variable.
+
+A stackful mode (one stack per task, `await` anywhere) would need a stack per
+task (KiBs instead of a 64 B frame) and a context switch per wait, so it is
+not offered. `coroutines.evented` already gives that model on `Io.Evented`.
+
+`Race(A, B)` polls both tasks in the same task. They share one waker, so
+nothing extra is spawned. The loser's `deinit` runs as soon as the winner is
+ready. `Race(T, rt.Sleep)` is a timeout for any task. `All(A, B)` waits for
+both.
 
 ## Scheduler
 
@@ -99,12 +201,20 @@ The design is the one tokio and Go use, written for stackless Zig tasks:
 
 ### Trade-offs
 
-* Tasks are hand-written state machines: no `async`/`await` sugar in Zig 0.17.
-* The LIFO slot is not stealable, and up to 7 tasks spawned during one long
-  poll stay invisible to thieves until that poll returns. A task that spawns
-  work and then computes for a long time should `yieldNow` first.
-* No timers or I/O reactor yet: tasks are woken by joins, channels, semaphores
-  or `Waker`s (which plain threads, e.g. blocking I/O threads, can call).
+* Tasks are state machines, written by hand or with `Seq`. There is no
+  `async`/`await` sugar in Zig 0.17.
+* The LIFO slot and up to 7 unpublished tasks are only seen by other workers
+  after the poll returns or after the monitor rescues them. That is 1–2
+  `monitor_interval_ns` into a long poll, not immediately. A task that spawns
+  work and then computes for a long time is still better off calling
+  `yieldNow` first.
+* The reactor is readiness-based (`kqueue`/`epoll`). Windows has timers and
+  the blocking pool but no socket reactor. File I/O goes through the blocking
+  pool.
+* There is one driver thread per runtime. A timer fired or a readiness event
+  costs a cross-thread wake: injector, then futex, on the order of
+  microseconds. tokio's workers poll the driver themselves. This design keeps
+  the worker hot path free of driver checks.
 * `deinit` drops tasks that are still pending without running their `deinit`
   (their frames are freed with the slabs).
 

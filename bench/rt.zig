@@ -290,6 +290,102 @@ const FanRoot = struct {
     }
 };
 
+// ---- the same two workloads written with `rt.Seq` (no hand-written state
+// machine); they must cost the same as JoinOne / PingRoot.
+const SeqJoinOne = rt.Seq(struct {
+    pub const Output = u64;
+    pub const steps = .{ spawn, join };
+    m: *Meter,
+    i: u64 = 0,
+    sum: u64 = 0,
+    h: rt.JoinHandle(Tiny) = undefined,
+    const C = @This();
+    pub fn output(c: *C) u64 {
+        c.m.stop();
+        return c.sum;
+    }
+    fn spawn(c: *C, cx: *Context) rt.Flow {
+        if (c.i == 0) c.m.start();
+        if (c.i == JOIN_ONE_N) return .done;
+        c.h = cx.runtime().spawn(Tiny, .{ .i = c.i }) catch @panic("oom");
+        return .next;
+    }
+    fn join(c: *C, cx: *Context) rt.Flow {
+        switch (c.h.poll(cx)) {
+            .pending => return .pending,
+            .ready => |r| c.sum +%= r catch unreachable,
+        }
+        c.i += 1;
+        return .{ .jump = 0 };
+    }
+});
+
+const SeqPong = rt.Seq(struct {
+    pub const Output = void;
+    pub const steps = .{ recv, send };
+    a: *Chan,
+    b: *Chan,
+    left: u32,
+    v: ?u32 = null,
+    rw: Chan.RecvWaiter = .{},
+    sw: Chan.SendWaiter = .{},
+    const C = @This();
+    pub fn output(_: *C) void {}
+    fn recv(c: *C, cx: *Context) rt.Flow {
+        if (c.left == 0) return .done;
+        return rt.into(?u32, c.a.recv(cx, &c.rw), &c.v);
+    }
+    fn send(c: *C, cx: *Context) rt.Flow {
+        switch (c.b.send(cx, &c.sw, c.v.? + 1)) {
+            .pending => return .pending,
+            .ready => |r| r catch unreachable,
+        }
+        c.left -= 1;
+        return .{ .jump = 0 };
+    }
+});
+
+const SeqPingRoot = rt.Seq(struct {
+    pub const Output = u32;
+    pub const steps = .{ start, send, recv, join };
+    m: *Meter,
+    a: Chan,
+    b: Chan,
+    i: u32 = 0,
+    v: ?u32 = 0,
+    rw: Chan.RecvWaiter = .{},
+    sw: Chan.SendWaiter = .{},
+    h: rt.JoinHandle(SeqPong) = undefined,
+    const C = @This();
+    pub fn output(c: *C) u32 {
+        c.m.stop();
+        return c.v.?;
+    }
+    fn start(c: *C, cx: *Context) rt.Flow {
+        c.m.start();
+        c.h = cx.runtime().spawn(SeqPong, .init(.{ .a = &c.a, .b = &c.b, .left = PINGPONG })) catch @panic("oom");
+        return .next;
+    }
+    fn send(c: *C, cx: *Context) rt.Flow {
+        if (c.i == PINGPONG) return .{ .jump = 3 };
+        return switch (c.a.send(cx, &c.sw, c.v.?)) {
+            .pending => .pending,
+            .ready => .next,
+        };
+    }
+    fn recv(c: *C, cx: *Context) rt.Flow {
+        if (rt.into(?u32, c.b.recv(cx, &c.rw), &c.v) == .pending) return .pending;
+        c.i += 1;
+        return .{ .jump = 1 };
+    }
+    fn join(c: *C, cx: *Context) rt.Flow {
+        return switch (c.h.poll(cx)) {
+            .pending => .pending,
+            .ready => .next,
+        };
+    }
+});
+
 // ---- skewed CPU work: 1% of tasks are 100x heavier
 pub fn lcg(iters: u64, seed: u64) u64 {
     var x = seed;
@@ -360,6 +456,18 @@ fn runAll(gpa: std.mem.Allocator, opts: rt.Options, suffix: []const u8, which: [
         var bb: [1]u32 = undefined;
         std.mem.doNotOptimizeAway(try r.blockOn(PingRoot, .{ .m = &m, .a = .init(&ba), .b = .init(&bb) }));
         m.emit(try std.fmt.bufPrint(&name_buf, "pingpong_rt_{s}", .{suffix}), PINGPONG);
+    }
+    if (all or std.mem.indexOf(u8, which, "seqjoin") != null) {
+        var m: Meter = .{};
+        std.mem.doNotOptimizeAway(try r.blockOn(SeqJoinOne, .init(.{ .m = &m })));
+        m.emit(try std.fmt.bufPrint(&name_buf, "spawnjoin1seq_rt_{s}", .{suffix}), JOIN_ONE_N);
+    }
+    if (all or std.mem.indexOf(u8, which, "seqping") != null) {
+        var m: Meter = .{};
+        var ba: [1]u32 = undefined;
+        var bb: [1]u32 = undefined;
+        std.mem.doNotOptimizeAway(try r.blockOn(SeqPingRoot, .init(.{ .m = &m, .a = .init(&ba), .b = .init(&bb) })));
+        m.emit(try std.fmt.bufPrint(&name_buf, "pingpongseq_rt_{s}", .{suffix}), PINGPONG);
     }
     if (all or std.mem.indexOf(u8, which, "fanin") != null) {
         var m: Meter = .{};
