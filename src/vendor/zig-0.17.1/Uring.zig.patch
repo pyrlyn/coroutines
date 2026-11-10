@@ -1,0 +1,30 @@
+--- lib/std/Io/Uring.zig	2026-11-02 23:41:32
++++ b/Uring.zig	2026-11-10 07:22:07
+@@ -39,7 +39,7 @@
+ const splat_buffer_size = Io.Threaded.splat_buffer_size;
+ const statFromLinux = Io.Threaded.statFromLinux;
+ const statxKind = Io.Threaded.statxKind;
+-const std = @import("../std.zig");
++const std = @import("std");
+ const timestampFromPosix = Io.Threaded.timestampFromPosix;
+ const unexpectedErrno = std.posix.unexpectedErrno;
+ const winsize = std.posix.winsize;
+@@ -2402,10 +2402,6 @@
+                 return error.ConcurrencyUnavailable
+             else
+                 .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
+-            .net_accept => |o| {
+-                _ = o;
+-                @panic("TODO implement batchDrainSubmitted for net_receive");
+-            },
+             .net_receive => |o| {
+                 _ = o;
+                 @panic("TODO implement batchDrainSubmitted for net_receive");
+@@ -2525,7 +2521,6 @@
+                     },
+                 },
+                 .device_io_control => unreachable,
+-                .net_accept => @panic("TODO"),
+                 .net_receive => @panic("TODO"),
+                 .net_send => @panic("TODO"),
+                 .net_read => @panic("TODO"),

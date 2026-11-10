@@ -1,5 +1,5 @@
 //! Benchmarks: `zig build bench` (ReleaseFast) or `zig-out/bin/bench [suite]`.
-//! Suites: switch, spawn, procs, all (default). Every measured variant runs in
+//! Suites: switch, spawn, procs, evented, all (default). Every measured variant runs in
 //! its own child process (`bench variant <name>`), so peak RSS, page faults and
 //! context switches are attributed to that variant only.
 const std = @import("std");
@@ -9,6 +9,12 @@ const sm = coro.state_machine;
 const Io = std.Io;
 
 const is_windows = builtin.os.tag == .windows;
+
+/// Lets `coroutines.evented` run in this ReleaseFast binary despite the
+/// upstream fiber bug in optimized builds (see `evented.allow_optimized`).
+/// A crashing `ev-*` variant is reported as failed, not hidden.
+pub const coroutines_evented_allow_optimized = true;
+const ev = coro.evented;
 
 // ------------------------------------------------------------ workload
 
@@ -214,6 +220,10 @@ fn pong(io: Io, a: *Io.Queue(u32), b: *Io.Queue(u32), n: usize) Io.Cancelable!vo
     }
 }
 
+fn evPong(io: Io, a: *ev.Channel(u32), b: *ev.Channel(u32), n: usize) ev.Channel(u32).Error!void {
+    for (0..n) |_| try b.send(io, (try a.recv(io)) + 1);
+}
+
 fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const u8) !Result {
     const io = init.io;
     var counting: Counting = .{ .child = std.heap.page_allocator };
@@ -350,6 +360,71 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         try d.shutdown();
         r.ns = now(io) - t0;
         r.ops = msgs;
+    } else if (std.mem.eql(u8, name, "ev-switch")) {
+        // Same ping-pong as io-switch, on the evented runtime: each handoff
+        // suspends one fiber and resumes the other.
+        if (!ev.available) return error.EventedUnavailable;
+        var rt: ev.Runtime = undefined;
+        try rt.init(ca, .{});
+        defer rt.deinit();
+        const eio = rt.io();
+        var ba: [1]u32 = undefined;
+        var bb: [1]u32 = undefined;
+        var qa: ev.Channel(u32) = .init(&ba);
+        var qb: ev.Channel(u32) = .init(&bb);
+        const a0 = counting.allocs.load(.monotonic);
+        const t0 = now(io);
+        var f = try rt.spawn(evPong, .{ eio, &qa, &qb, handoffs });
+        var v: u32 = 0;
+        for (0..handoffs) |_| {
+            try qa.send(eio, v);
+            v = try qb.recv(eio);
+        }
+        try f.await(eio);
+        r.ns = now(io) - t0;
+        r.ops = handoffs * 2;
+        r.allocs = counting.allocs.load(.monotonic) - a0;
+        r.threads = 2;
+        r.check = v;
+    } else if (std.mem.eql(u8, name, "ev-group")) {
+        // io-group (spawnEach + Group.await) on the evented runtime.
+        if (!ev.available) return error.EventedUnavailable;
+        var rt: ev.Runtime = undefined;
+        try rt.init(ca, .{});
+        defer rt.deinit();
+        const eio = rt.io();
+        r.threads = cpuCount();
+        const t0 = now(io);
+        var g: Io.Group = .init;
+        coro.io.spawnEach(eio, &g, n_tasks, ioTask, &out);
+        try g.await(eio);
+        r.ns = now(io) - t0;
+        r.check = out.load(.monotonic);
+    } else if (std.mem.eql(u8, name, "ev-dispatch")) {
+        // io-dispatch on the evented runtime.
+        if (!ev.available) return error.EventedUnavailable;
+        var rt: ev.Runtime = undefined;
+        try rt.init(ca, .{});
+        defer rt.deinit();
+        const eio = rt.io();
+        r.threads = cpuCount();
+        const msgs = n_tasks * 10;
+        const D = coro.io.Dispatcher(u64, *std.atomic.Value(u64), dispatchHandle);
+        var qbuf: [256]u64 = undefined;
+        const t0 = now(io);
+        var d: D = .init(eio, &out, &qbuf);
+        try d.start(r.threads);
+        var batch: [64]u64 = undefined;
+        var i: usize = 0;
+        while (i < msgs) {
+            const k = @min(batch.len, msgs - i);
+            for (batch[0..k], 0..) |*m, j| m.* = i + j;
+            try d.submitMany(batch[0..k]);
+            i += k;
+        }
+        try d.shutdown();
+        r.ns = now(io) - t0;
+        r.ops = msgs;
     } else if (std.mem.eql(u8, name, "sm-big")) {
         // 504-byte tasks finishing at different rounds.
         r.threads = cpuCount();
@@ -417,6 +492,7 @@ const Suite = struct { name: []const u8, title: []const u8, variants: []const []
 const suites = [_]Suite{
     .{ .name = "switch", .title = "Switch cost", .variants = &.{ "sm-switch", "io-switch" } },
     .{ .name = "spawn", .title = "Spawn and run 10,000 small tasks", .variants = &.{ "sm-1thread", "sm-parallel", "io-group" } },
+    .{ .name = "evented", .title = "std.Io.Threaded vs evented runtime (coroutines.evented)", .variants = &.{ "io-switch", "ev-switch", "io-group", "ev-group", "io-dispatch", "ev-dispatch" } },
     .{ .name = "procs", .title = "Processes vs coroutines, same 10,000-task workload", .variants = &.{ "sequential", "procs2", "sm-1thread", "sm-parallel", "io-group" } },
 };
 

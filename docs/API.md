@@ -1,6 +1,6 @@
 # API reference
 
-Zig 0.17.0, standard library only. Import: `const coro = @import("coroutines");`
+Zig 0.17.1, standard library only. Import: `const coro = @import("coroutines");`
 
 Public surface (everything else is internal):
 
@@ -158,6 +158,32 @@ try d.start(1);
 for (0..100) |i| try d.submit(i);
 try d.shutdown(); // total == 4950
 ```
+
+## `evented`
+
+Evented runtime and primitives. See the README for the caveats with Zig 0.17.1.
+
+* `available: bool`, `backend: enum { none, io_uring, dispatch }`, `allow_optimized: bool`.
+* `Runtime`:
+  * `init(rt: *Runtime, gpa: Allocator, options: Runtime.Options) !void`.
+  * `deinit(rt)`: waits for fibers freed asynchronously by the backend, then tears it down.
+  * `io(rt) Io`.
+  * `spawn(rt, function, args) Io.ConcurrentError!Io.Future(R)`.
+  * Do not move it after `init`; call `init` and `deinit` on the same thread.
+* `Scope`:
+  * `init(io)`.
+  * `spawn(s, function, args) Io.ConcurrentError!void`, where `function` returns `E!void`.
+  * `join(s) anyerror!void`: returns the first error after canceling and joining the remaining tasks.
+  * `cancel(s)`, `firstError(s) ?anyerror`.
+* `Channel(T)`:
+  * `init(buffer)`, `capacity`.
+  * `send` / `sendAll` suspend while the channel is full; `trySend` returns false when full.
+  * `recv` / `recvMany` suspend while it is empty; `tryRecv` returns null when empty.
+  * `close`: idempotent; receivers drain the buffer first, then get `error.Closed`.
+* `Limiter`:
+  * `init(io, buffer)`: `buffer.len` permits.
+  * `acquire` (cancelable, FIFO), `tryAcquire`, `release`, `permits`.
+  * `run(io, function, args)`: acquire, call, release.
 
 ## Processes
 
