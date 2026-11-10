@@ -555,7 +555,11 @@ pub const Driver = struct {
         errdefer d.poller.deinit();
         d.last_seq = try d.r.gpa.alloc(u32, d.r.workers.len);
         @memset(d.last_seq, 0);
-        d.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{d});
+        // Must exceed `std.options.signal_stack_size` (256 KiB). A smaller
+        // stack makes `pthread_create` fail with `error.Unexpected` when the
+        // binary links libc (Linux benches do); tests that do not link libc
+        // were not affected.
+        d.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, run, .{d});
         d.started.store(true, .release);
     }
 
