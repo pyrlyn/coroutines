@@ -26,8 +26,9 @@ pub fn LocalQueue(comptime Node: type) type {
         head: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
         /// Published tail (what thieves see).
         tail: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
-        /// Real tail. Written by the owner only (release, so the runtime's
-        /// monitor may publish it for a stuck owner, see `publishRemote`).
+        /// Real tail. Written by the owner only. Monotonic (not release) so a
+        /// push is a plain store; `publishRemote` may still observe it after
+        /// the driver has started.
         ptail: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
         /// Owner-only: a lower bound of `steal`.
         cached_steal: u32 = 0,
@@ -76,7 +77,7 @@ pub fn LocalQueue(comptime Node: type) type {
         /// a long poll. Never moves `tail` backwards, so it may race with
         /// the owner's own `publish`. Returns true if it published anything.
         pub fn publishRemote(q: *Self) bool {
-            const p = q.ptail.load(.acquire);
+            const p = q.ptail.load(.monotonic);
             var t = q.tail.load(.monotonic);
             while (@as(i32, @bitCast(p -% t)) > 0) {
                 t = q.tail.cmpxchgWeak(t, p, .seq_cst, .monotonic) orelse return true;
@@ -92,7 +93,7 @@ pub fn LocalQueue(comptime Node: type) type {
             if (t -% q.cached_steal < capacity) {
                 @branchHint(.likely);
                 q.buf[t & mask].store(n, .monotonic);
-                q.ptail.store(t +% 1, .release);
+                q.ptail.store(t +% 1, .monotonic);
                 return;
             }
             while (true) {
@@ -102,7 +103,7 @@ pub fn LocalQueue(comptime Node: type) type {
                 q.cached_steal = steal;
                 if (t -% steal < capacity) {
                     q.buf[t & mask].store(n, .monotonic);
-                    q.ptail.store(t +% 1, .release);
+                    q.ptail.store(t +% 1, .monotonic);
                     return;
                 }
                 q.publish();
@@ -194,7 +195,7 @@ pub fn LocalQueue(comptime Node: type) type {
             n -= 1;
             const ret = dst.buf[(dst_tail +% n) & mask].load(.monotonic);
             if (n > 0) {
-                dst.ptail.store(dst_tail +% n, .release);
+                dst.ptail.store(dst_tail +% n, .monotonic);
                 dst.publish();
             }
             return ret;

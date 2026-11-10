@@ -1091,50 +1091,18 @@ const Flag = struct {
     }
 };
 
-/// Waits for a waker, then sets the flag.
-const WakeThenFlag = struct {
-    pub const Output = void;
-    flag: *std.atomic.Value(bool),
-    slot: *?rt.Waker,
-    started: bool = false,
-    pub fn poll(self: *WakeThenFlag, cx: *Context) Poll(void) {
-        if (!self.started) {
-            self.started = true;
-            self.slot.* = cx.waker();
-            return .pending;
-        }
-        self.flag.store(true, .release);
-        return .{ .ready = {} };
-    }
-};
-
-/// Hands work to the LIFO slot (`lifo`) or the unpublished tail, then
-/// blocks the worker in a long poll until that work ran elsewhere.
+/// Pushes work onto the unpublished queue tail, then blocks this worker in a
+/// long poll until that work ran on the other worker (the monitor publishes
+/// the tail). The LIFO slot stays local and is not stolen.
 const Hog = struct {
     pub const Output = bool;
-    lifo: bool,
     flag: std.atomic.Value(bool) = .init(false),
-    slot: ?rt.Waker = null,
     step: u8 = 0,
     pub fn poll(self: *Hog, cx: *Context) Poll(bool) {
         const r = cx.runtime();
         if (self.step == 0) {
             self.step = 1;
-            if (!self.lifo) {
-                r.spawnDetached(Flag, .{ .flag = &self.flag }) catch @panic("oom");
-            } else {
-                r.spawnDetached(WakeThenFlag, .{ .flag = &self.flag, .slot = &self.slot }) catch @panic("oom");
-                cx.yieldNow();
-                return .pending;
-            }
-        }
-        if (self.lifo and self.step == 1) {
-            if (self.slot == null) {
-                cx.yieldNow();
-                return .pending;
-            }
-            self.step = 2;
-            self.slot.?.wake(); // into this worker's LIFO slot
+            r.spawnDetached(Flag, .{ .flag = &self.flag }) catch @panic("oom");
         }
         const t0 = r.now();
         while (!self.flag.load(.acquire)) {
@@ -1149,9 +1117,11 @@ test "monitor: work held by a worker stuck in a long poll is stolen" {
     var r: rt.Runtime = undefined;
     try r.init(testing.allocator, testing.io, .{ .workers = 2 });
     defer r.deinit();
+    // The driver (and therefore the monitor) starts on first timer / IoSource,
+    // not in init. Start it here so unpublished work can be published remotely.
+    try r.driver().ensureStarted();
     for (0..5) |_| {
-        try testing.expect(try r.blockOn(Hog, .{ .lifo = false }));
-        try testing.expect(try r.blockOn(Hog, .{ .lifo = true }));
+        try testing.expect(try r.blockOn(Hog, .{}));
     }
     try r.blockOn(Settle, .{});
     try testing.expect(r.monitorRescues() > 0);

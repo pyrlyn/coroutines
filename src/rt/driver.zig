@@ -9,11 +9,11 @@
 //!   deadline or shutdown pokes it (`EVFILT_USER` / `eventfd`). Windows has no
 //!   reactor here (no IOCP yet): the driver sleeps on a futex with a timeout,
 //!   so timers and the blocking pool work, sockets do not.
-//! * The monitor: while any worker is busy, every `monitor_interval_ns` the
-//!   driver checks whether a worker has been inside one poll for a whole
-//!   interval while holding a task nobody else can see (its LIFO slot or
-//!   unpublished queue tail). Such a worker is marked stuck and a parked
-//!   worker is woken to steal from it.
+//! * The monitor runs only after the driver starts (first timer or IoSource).
+//!   While any worker is busy, every `monitor_interval_ns` it checks whether a
+//!   worker has been inside one poll for a whole interval with unpublished
+//!   queue tasks, and publishes that tail so others can steal. The LIFO slot
+//!   stays local (the same trade-off as tokio).
 const std = @import("std");
 const builtin = @import("builtin");
 const rt = @import("../rt.zig");
@@ -544,6 +544,11 @@ pub const Driver = struct {
         d.* = .{ .r = r };
     }
 
+    /// Whether the driver thread is running (first timer or IoSource).
+    pub fn isStarted(d: *const Driver) bool {
+        return d.started.load(.monotonic);
+    }
+
     /// Starts the driver thread once (lazily).
     pub fn ensureStarted(d: *Driver) !void {
         if (d.started.load(.acquire)) return;
@@ -658,9 +663,9 @@ pub const Driver = struct {
         }
     }
 
-    /// Moves work a busy worker holds privately (its LIFO slot and its
-    /// unpublished queue tail) to where others can take it, if the worker
-    /// has been inside the same poll since the last check.
+    /// Publishes a stuck worker's unpublished queue tail so others can steal
+    /// it, if that worker has been inside the same poll since the last check.
+    /// The LIFO slot is left alone (it is not atomic).
     fn monitor(d: *Driver) void {
         const r = d.r;
         if (r.workers.len < 2) return;
@@ -668,15 +673,9 @@ pub const Driver = struct {
             const seq = w.poll_seq.load(.monotonic);
             const same = seq == d.last_seq[i];
             d.last_seq[i] = seq;
+            // Odd seq: still inside the same poll as last time.
             if (!same or seq & 1 == 0) continue;
-            var moved = false;
-            if (w.lifo.load(.monotonic) != null) if (w.lifo.swap(null, .acquire)) |t| {
-                t.next = null;
-                r.injector.pushBatch(r.io, t, t, 1);
-                moved = true;
-            };
-            if (w.queue.publishRemote()) moved = true;
-            if (moved) {
+            if (w.queue.publishRemote()) {
                 _ = d.rescued.fetchAdd(1, .monotonic);
                 r.notifyParked();
             }

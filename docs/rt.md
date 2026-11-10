@@ -57,7 +57,7 @@ const v = try r.blockOn(Parent, .{}); // 42
 | item | what it does |
 |---|---|
 | `Runtime.init(*Runtime, gpa, io, Options)` / `deinit` | start / stop the workers; `gpa` must be thread-safe; the runtime must not move |
-| `Options` | `workers` (0 = CPUs), `current_thread` (no threads; `blockOn` drives the scheduler), `stack_size`, `spin_rounds`, `monitor_interval_ns` (stuck-worker check, default 1 ms, 0 = off) |
+| `Options` | `workers` (0 = CPUs), `current_thread` (no threads; `blockOn` drives the scheduler), `stack_size`, `spin_rounds`, `monitor_interval_ns` (stuck-worker check once the driver is running, default 1 ms, 0 = off) |
 | `Runtime.blockOn(T, task) !T.Output` | run a root task to completion from a plain thread |
 | `Runtime.spawn(T, task) !JoinHandle(T)` / `spawnDetached` | spawn from anywhere (a task of this runtime: its worker's queue; elsewhere: the injector) |
 | `JoinHandle(T).poll(cx)` | wait for the result (`error.Canceled` after `abort`); `tryResult`, `isFinished`, `abort`, `deinit` (detach) |
@@ -100,10 +100,12 @@ const WithTimeout = struct {
 };
 ```
 
-* **Driver thread.** Each runtime has one driver thread, which multi-thread
-  runtimes start in `init`. A `current_thread` runtime starts it on the first
-  timer or `IoSource`. The driver owns the timers and the OS poller. It wakes
-  tasks through the normal wake path: injector, then a parked worker.
+* **Driver thread.** Each runtime has at most one driver thread. It starts
+  lazily, on the first timer or `IoSource` (the same on `current_thread` and
+  on a worker pool). Until then there is no extra thread, and the worker hot
+  path does not touch the monitor. The driver owns the timers and the OS
+  poller. It wakes tasks through the normal wake path: injector, then a
+  parked worker.
 * **Timers** are intrusive nodes of a pairing heap. Arming one allocates
   nothing, and the earliest deadline is exact. The driver sleeps in the poller
   until that deadline. Nothing busy-waits. A new earlier deadline pokes it.
@@ -122,15 +124,13 @@ const WithTimeout = struct {
   of up to 16 threads and wakes the task when it returns. This is a thread
   doing a blocking `pread`, not asynchronous file I/O. `Runtime.deinit` waits
   for running operations.
-* **Monitor.** While some worker is awake, the driver checks every
-  `monitor_interval_ns`. A worker can stay inside the same poll since the last
-  check while it holds tasks nobody else can see: its LIFO slot, or tasks it
-  pushed but has not published yet. The driver then moves the LIFO task to the
-  injector, publishes the queue tail for the worker, and wakes a parked worker
-  to steal them. This is what tokio does not do (its LIFO slot stays local)
-  and what Go's sysmon does, minus preemption. Cost on the hot path: a
-  counter store before and after every poll, and an atomic swap to take the
-  LIFO slot.
+* **Monitor.** Once the driver is running, while some worker is awake it
+  checks every `monitor_interval_ns`. A worker can stay inside the same poll
+  while it holds unpublished queue tasks (up to 7). The driver then publishes
+  that tail and wakes a parked worker to steal them — the same idea as Go's
+  sysmon, minus preemption. The LIFO slot stays local, as in tokio, so
+  ping-pong and spawn+join do not pay an atomic on the wake path. `poll_seq`
+  (a stuck-poll counter) is only stored after the driver has started.
 
 ### `Seq`, `Race`, `All`
 
@@ -203,18 +203,19 @@ The design is the one tokio and Go use, written for stackless Zig tasks:
 
 * Tasks are state machines, written by hand or with `Seq`. There is no
   `async`/`await` sugar in Zig 0.17.
-* The LIFO slot and up to 7 unpublished tasks are only seen by other workers
-  after the poll returns or after the monitor rescues them. That is 1–2
-  `monitor_interval_ns` into a long poll, not immediately. A task that spawns
-  work and then computes for a long time is still better off calling
-  `yieldNow` first.
+* The LIFO slot is not stealable. Up to 7 unpublished tasks stay invisible to
+  thieves until the poll returns, or — once the driver is running — until the
+  monitor publishes them (1–2 `monitor_interval_ns` into a long poll). A task
+  that spawns work and then computes for a long time is still better off
+  calling `yieldNow` first.
 * The reactor is readiness-based (`kqueue`/`epoll`). Windows has timers and
   the blocking pool but no socket reactor. File I/O goes through the blocking
   pool.
-* There is one driver thread per runtime. A timer fired or a readiness event
-  costs a cross-thread wake: injector, then futex, on the order of
-  microseconds. tokio's workers poll the driver themselves. This design keeps
-  the worker hot path free of driver checks.
+* There is at most one driver thread per runtime, started on the first timer
+  or `IoSource`. A timer fired or a readiness event costs a cross-thread wake:
+  injector, then futex, on the order of microseconds. tokio's workers poll the
+  driver themselves. This design keeps the worker hot path free of driver
+  checks until that first timer or I/O wait.
 * `deinit` drops tasks that are still pending without running their `deinit`
   (their frames are freed with the slabs).
 

@@ -419,13 +419,16 @@ const Worker = struct {
     queue: LocalQueue = .{},
     rt: *Runtime align(cache_line),
     index: u32,
-    /// Runs next. Atomic only so the monitor can take it from a stuck worker.
-    lifo: std.atomic.Value(?*Header) = .init(null),
+    /// Runs next. Owner-only, like tokio's LIFO slot: the monitor does not
+    /// take it, so a plain pointer stays off the atomic path.
+    lifo: ?*Header = null,
     lifo_streak: u8 = 0,
     searching: bool = false,
     polling: bool = false,
-    /// Odd while a task is being polled (read by the monitor).
-    poll_seq: std.atomic.Value(u32) = .init(0),
+    /// Odd while a task is being polled. The monitor samples this only after
+    /// the driver thread has been started; the hot path does not touch it
+    /// until then. Isolated so sampling does not bounce the LIFO / queue lines.
+    poll_seq: std.atomic.Value(u32) align(cache_line) = .init(0),
     tick: u32 = 0,
     rng: u64,
     free: [n_classes]FreeList = @splat(.{}),
@@ -452,8 +455,10 @@ pub const Options = struct {
     stack_size: usize = 1024 * 1024,
     /// Spin rounds an idle worker makes before parking.
     spin_rounds: u32 = 64,
-    /// How often the driver checks for a worker stuck in one long poll while
-    /// holding tasks nobody else can see (0 = never). Multi-thread only.
+    /// How often the driver, once started, checks for a worker stuck in one
+    /// long poll while holding unpublished tasks (0 = never). Multi-thread
+    /// only. The driver itself starts on the first timer or `IoSource`, not
+    /// in `init`.
     monitor_interval_ns: u64 = std.time.ns_per_ms,
 };
 
@@ -496,8 +501,6 @@ pub const Runtime = struct {
         errdefer gpa.free(r.idle.is_idle);
         @memset(r.idle.is_idle, false);
         if (opts.current_thread) return;
-        if (n > 1 and opts.monitor_interval_ns > 0) try r.drv.ensureStarted();
-        errdefer r.drv.deinit();
         r.threads = try gpa.alloc(std.Thread, n);
         var started: usize = 0;
         errdefer {
@@ -613,14 +616,12 @@ pub const Runtime = struct {
         if (tl_worker) |w| if (w.rt == r) {
             if (kind == .wake and w.polling) {
                 // Run next on this core. A displaced task becomes stealable.
-                if (w.lifo.load(.monotonic) == null) {
-                    // Only this worker fills the slot: a plain store is enough.
-                    w.lifo.store(h, .release);
-                } else if (w.lifo.swap(h, .acq_rel)) |prev| {
+                if (w.lifo) |prev| {
+                    w.lifo = h;
                     w.queue.push(prev, r, overflowToInjector);
                     w.queue.publish();
                     r.notifyParked();
-                }
+                } else w.lifo = h;
                 return;
             }
             w.queue.push(h, r, overflowToInjector);
@@ -748,10 +749,13 @@ pub const Runtime = struct {
             if (r.idle.searching.fetchSub(1, .seq_cst) == 1) r.notifyParked();
         }
         w.polling = true;
-        const seq = w.poll_seq.raw;
-        w.poll_seq.store(seq +% 1, .monotonic);
+        // poll_seq is only for the stuck-worker monitor, which runs after the
+        // driver starts (first timer or IoSource). Skip the stores until then
+        // so spawn / ping-pong / yield do not pay two atomics per poll.
+        const track = r.drv.isStarted();
+        if (track) w.poll_seq.store(w.poll_seq.raw +% 1, .monotonic);
         t.vtable.run(t);
-        w.poll_seq.store(seq +% 2, .monotonic);
+        if (track) w.poll_seq.store(w.poll_seq.raw +% 1, .monotonic);
         w.polling = false;
         if (w.queue.unpublished() != 0) {
             w.queue.publish();
@@ -764,13 +768,14 @@ pub const Runtime = struct {
         if (w.tick % injector_check_interval == 0) {
             if (r.takeInjector(w)) |t| return t;
         }
-        if (w.lifo.load(.monotonic) != null) if (w.lifo.swap(null, .acquire)) |t| {
+        if (w.lifo) |t| {
+            w.lifo = null;
             if (w.lifo_streak < max_lifo_streak) {
                 w.lifo_streak += 1;
                 return t;
             }
             w.queue.push(t, r, overflowToInjector);
-        };
+        }
         w.lifo_streak = 0;
         if (w.queue.pop()) |t| {
             if (w.queue.ownerLen() != 0) {
