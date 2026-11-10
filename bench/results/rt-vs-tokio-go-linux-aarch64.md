@@ -1,48 +1,49 @@
-# `rt` vs tokio vs Go — Linux aarch64 (Lima `default`), 2026-11-10 10:03–10:06 EET
+# `rt` vs tokio vs Go — Linux aarch64 (Lima `default`), after lazy driver start, 2026-11-10 10:33:59–10:37:48 EET
 
-Same methodology as the macOS ABBA: 7 fresh-process runs, order A B B A A B B, median ns/op, phase-1 `rt` (`1152a15`, `rtp1`) in the same loop.
+Same methodology as the macOS ABBA: 11 fresh-process runs, order A B B A A B B A A B B, median ns/op, phase-1 `rt` (`1152a15`, `rtp1`) in the same loop. Fix commit `2efdb67` (lazy driver start, local LIFO, `poll_seq` only after the driver is up).
 
 * Host: Lima VM `default`, Ubuntu (`Linux 7.0.0-38-generic aarch64`), **4 vCPUs**, 4 GiB. Existing VM, config not changed. Binaries were cross-compiled on the Mac (Zig 0.17.1, `aarch64-linux-gnu`, ReleaseFast) and run in the guest.
 * Multi-thread = CPU count (4), not 16: oversubscribing a 4-vCPU VM would not be comparable. tokio uses its default (4), Go `GOMAXPROCS=4`.
-* **Load:** guest load average 0.22–1.93 (start 0.22 0.78 0.63, end 1.93 1.27 0.84). The guest was otherwise idle; the host Mac still had other jobs (load ~8–10).
-* The first Linux attempt of this binary failed every multi-thread run with `error.Unexpected`. Cause: the driver thread was spawned with a 256 KiB stack; when the bench links libc, `pthread_create` fails because `std.options.signal_stack_size` is also 256 KiB. The driver stack is now 1 MiB (same as a worker). Tests were not affected: they do not link libc.
+* **Load:** guest load average 0.06–1.98 (start 0.06 0.04 0.15, end 1.69 0.99 0.52). The guest was otherwise idle.
 
 ## ns per operation, median (min–max)
 
 | workload | threads | pyrlyn before (Io.Threaded) | **pyrlyn rt** | tokio | Go | winner |
 |---|---|---:|---:|---:|---:|---|
-| spawn + join one | 1 | — | **47.2** (46.0–73.8) | 93.0 (84.7–123.8) | 250.2 (222.6–424.6) | rt, 2.0× vs tokio |
-| spawn + join one | 4 | 23312 | **47.2** (43.5–77.3) | 285.9 (244.4–332.7) | 252.4 (208.9–391.7) | rt, 5.4× vs Go |
-| spawn 1M, join all | 1 | — | **62.5** (54.8–93.7) | 135.1 (122.3–206.4) | 575.1 (539.1–748.5) | rt, 2.2× vs tokio |
-| spawn 1M, join all | 4 | 107 | **34.9** (31.9–51.4) | 325.5 (272.4–513.9) | 301.0 (238.0–479.6) | rt, 8.6× vs Go |
-| channel ping-pong | 1 | — | **45.9** (43.8–75.4) | 93.3 (88.2–165.4) | 193.6 (187.6–346.3) | rt, 2.0× vs tokio |
-| channel ping-pong | 4 | 22522 | **47.9** (45.3–86.4) | 274.4 (270.5–403.7) | 225.6 (186.3–388.9) | rt, 4.7× vs Go |
-| fan-out / fan-in | 1 | — | **134.1** (114.8–207.8) | 200.0 (178.5–343.1) | 2233 (1872–3439) | rt, 1.5× vs tokio |
-| fan-out / fan-in | 4 | — | **96.0** (86.2–170.0) | 662.6 (574.2–1098.8) | 1559 (1396–2265) | rt, 6.9× vs tokio |
-| skewed CPU work | 1 | — | **1773** (1702–2862) | 1951 (1775–3341) | 2880 (2677–4918) | rt, 1.1× vs tokio |
-| skewed CPU work | 4 | — | **453** (436–843) | 697 (518–1001) | 829 (721–1341) | rt, 1.5× vs tokio |
-| yield switch | 1 | — | **16.0** (15.5–27.4) | 56.4 (50.7–80.3) | 55.4 (50.6–80.7) | rt, 3.5× vs Go |
-| yield switch | 4 | — | **11.7** (10.6–16.5) | 192.1 (155.0–220.2) | 141.0 (119.7–197.0) | rt, 12.0× vs Go |
+| spawn + join one | 1 | — | **48.2** (43.7–50.2) | 88.6 (82.0–91.7) | 223.7 (214.9–240.3) | rt, 1.8× vs tokio |
+| spawn + join one | 4 | 21100 | **46.4** (43.2–51.6) | 239.0 (188.5–258.6) | 221.7 (214.0–233.5) | rt, 4.8× vs Go |
+| spawn 1M, join all | 1 | — | **55.7** (46.4–62.6) | 132.1 (121.3–159.0) | 541.8 (439.3–574.6) | rt, 2.4× vs tokio |
+| spawn 1M, join all | 4 | 95.9 (83.6–186.7) | **30.6** (25.6–32.0) | 310.0 (226.6–361.0) | 259.8 (181.1–371.9) | rt, 8.5× vs Go |
+| channel ping-pong | 1 | — | **37.9** (34.3–39.5) | 89.0 (82.5–95.9) | 197.7 (182.1–210.3) | rt, 2.3× vs tokio |
+| channel ping-pong | 4 | 20880 | **39.6** (37.5–42.4) | 264.2 (194.1–290.0) | 196.1 (189.6–208.5) | rt, 4.9× vs Go |
+| fan-out / fan-in | 1 | — | **115.0** (83.5–154.9) | 185.4 (173.7–197.3) | 2107 (1925–2710) | rt, 1.6× vs tokio |
+| fan-out / fan-in | 4 | — | **93.9** (68.0–100.4) | 637.4 (472.1–693.5) | 1444 (1394–1594) | rt, 6.8× vs tokio |
+| skewed CPU work | 1 | — | **1810** (1615–1881) | 1904 (1680–1969) | 2936 (2772–3116) | rt, 1.1× vs tokio |
+| skewed CPU work | 4 | — | **455.9** (430.4–495.8) | 571.1 (533.7–880.3) | 776.8 (668.8–820.9) | rt, 1.3× vs tokio |
+| yield switch | 1 | — | **16.4** (15.4–16.7) | 53.9 (47.6–64.0) | 52.6 (48.9–54.8) | rt, 3.2× vs Go |
+| yield switch | 4 | — | **11.5** (7.48–20.3) | 164.5 (129.6–194.8) | 120.2 (113.3–126.0) | rt, 10.5× vs Go |
 
-`Seq` is within 1 % of the hand-written ping-pong and spawn+join on this machine (e.g. ping-pong 4t **46.7** vs 47.9).
+`Seq` is within ~2 % of the hand-written ping-pong and spawn+join on this machine (spawn+join 1t **47.4** vs 48.2; 4t **46.9** vs 46.4; ping-pong 1t **37.5** vs 37.9; 4t **40.5** vs 39.6).
 
 ## vs phase-1 `rt` in the same loop
 
-| workload | threads | phase-1 rt | **phase-2 rt** | vs phase-1 |
-|---|---|---:|---:|---:|
-| spawn + join one | 1 | 45.7 (44.6–69.4) | **47.2** (46.0–73.8) | +3.3 % |
-| spawn + join one | 4 | 46.7 (45.1–70.8) | **47.2** (43.5–77.3) | +1.0 % |
-| spawn 1M, join all | 1 | 60.0 (52.8–78.2) | **62.5** (54.8–93.7) | +4.1 % |
-| spawn 1M, join all | 4 | 31.4 (29.6–42.4) | **34.9** (31.9–51.4) | +11.1 % |
-| channel ping-pong | 1 | 39.2 (36.8–55.4) | **45.9** (43.8–75.4) | +17.0 % |
-| channel ping-pong | 4 | 39.8 (38.6–65.4) | **47.9** (45.3–86.4) | +20.3 % |
-| fan-out / fan-in | 1 | 137.0 (115.0–173.1) | **134.1** (114.8–207.8) | −2.1 % |
-| fan-out / fan-in | 4 | 92.0 (82.7–131.4) | **96.0** (86.2–170.0) | +4.3 % |
-| skewed CPU work | 1 | 1738 (1674–2652) | **1773** (1702–2862) | +2.0 % |
-| skewed CPU work | 4 | 453 (437–843) | **453** (436–843) | −0.1 % |
-| yield switch | 1 | 15.7 (15.5–27.5) | **16.0** (15.5–27.4) | +2.0 % |
-| yield switch | 4 | 12.0 (9.4–14.5) | **11.7** (10.6–16.4) | −2.6 % |
+Every row is within 5 % of phase-1 `rt`. The previous 7-run at `58a0491` (driver started at init) had ping-pong +17–20 % and spawn 4t +11.1 %.
 
-Ping-pong (and spawn on 4 threads) is clearly slower than phase 1 on this 4-vCPU VM. A multi-thread runtime now starts a driver thread at `init` (epoll + 1 ms stuck-worker monitor), so five threads share four vCPUs; ping-pong is a two-task LIFO path that does not need that thread. Atomic LIFO/`poll_seq` (so the monitor can steal a stuck worker's private tasks) also sit on that path. The other rows stay within ~5 %. `rt` still wins every row against tokio and Go.
+| workload | threads | phase-1 rt | **phase-2 rt (after fix)** | vs p1 after fix | vs p1 before fix (`58a0491`, 7-run) |
+|---|---|---:|---:|---:|---:|
+| spawn + join one | 1 | 50.2 (44.5–51.2) | **48.2** (43.7–50.2) | −3.9 % | +3.3 % |
+| spawn + join one | 4 | 47.9 (45.1–50.1) | **46.4** (43.2–51.6) | −3.1 % | +1.0 % |
+| spawn 1M, join all | 1 | 56.3 (51.1–63.5) | **55.7** (46.4–62.6) | −1.1 % | +4.1 % |
+| spawn 1M, join all | 4 | 31.3 (26.2–32.5) | **30.6** (25.6–32.0) | −2.2 % | +11.1 % |
+| channel ping-pong | 1 | 38.5 (35.5–43.3) | **37.9** (34.3–39.5) | −1.6 % | +17.0 % |
+| channel ping-pong | 4 | 39.8 (37.4–42.9) | **39.6** (37.5–42.4) | −0.5 % | +20.3 % |
+| fan-out / fan-in | 1 | 113.8 (97.6–170.7) | **115.0** (83.5–154.9) | +1.0 % | −2.1 % |
+| fan-out / fan-in | 4 | 94.5 (68.0–108.3) | **93.9** (68.0–100.4) | −0.7 % | +4.3 % |
+| skewed CPU work | 1 | 1859 (1666–1954) | **1810** (1615–1881) | −2.6 % | +2.0 % |
+| skewed CPU work | 4 | 458.6 (431.0–492.0) | **455.9** (430.4–495.8) | −0.6 % | −0.1 % |
+| yield switch | 1 | 16.5 (15.3–16.9) | **16.4** (15.4–16.7) | −0.6 % | +2.0 % |
+| yield switch | 4 | 11.5 (8.22–15.9) | **11.5** (7.48–20.3) | −0.6 % | −2.6 % |
 
-Raw log: [`rt-vs-tokio-go-linux-aarch64.raw.txt`](rt-vs-tokio-go-linux-aarch64.raw.txt).
+`rt` still wins every row against tokio and Go.
+
+Raw log (load + 11 runs): [`rt-vs-tokio-go-linux-aarch64.raw.txt`](rt-vs-tokio-go-linux-aarch64.raw.txt).
