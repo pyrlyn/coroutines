@@ -48,9 +48,22 @@ const SmTask = struct {
     }
 };
 
-fn dispatchHandle(out: *std.atomic.Value(u64), msg: u64) void {
-    _ = out.fetchAdd(sliceWork(msg) & 0xff, .monotonic);
-}
+/// Like `SmTask`, but `left` fits long tasks (sm-skew).
+const SkewTask = struct {
+    acc: u64,
+    left: u16,
+    out: *std.atomic.Value(u64),
+    /// One slice of work; `.done` after `left` slices (adds `acc` to `out`).
+    pub fn step(t: *SkewTask) sm.Step {
+        t.acc = sliceWork(t.acc);
+        t.left -= 1;
+        if (t.left == 0) {
+            _ = t.out.fetchAdd(t.acc, .monotonic);
+            return .done;
+        }
+        return .yield;
+    }
+};
 
 /// `SmTask` with a 480-byte payload (sm-big): moving a task costs.
 const BigTask = struct {
@@ -58,6 +71,8 @@ const BigTask = struct {
     left: u8,
     out: *std.atomic.Value(u64),
     payload: [480]u8 = undefined,
+    /// One slice of work; `.done` after `left` slices (adds `acc` to `out`).
+    /// The 480-byte payload is never touched; it only makes the task large.
     pub fn step(t: *BigTask) sm.Step {
         t.acc = sliceWork(t.acc);
         t.left -= 1;
@@ -69,21 +84,38 @@ const BigTask = struct {
     }
 };
 
-/// Like `SmTask`, but `left` fits long tasks (sm-skew).
-const SkewTask = struct {
-    acc: u64,
-    left: u16,
+fn repeatRuns(
+    comptime T: type,
+    io: Io,
+    ca: std.mem.Allocator,
     out: *std.atomic.Value(u64),
-    pub fn step(t: *SkewTask) sm.Step {
-        t.acc = sliceWork(t.acc);
-        t.left -= 1;
-        if (t.left == 0) {
-            _ = t.out.fetchAdd(t.acc, .monotonic);
-            return .done;
-        }
-        return .yield;
+    pool: anytype,
+    threads: usize,
+    rounds: usize,
+    gap: bool,
+    comptime make: fn (usize, *std.atomic.Value(u64)) T,
+) !void {
+    _ = io;
+    const tasks = try ca.alloc(T, n_tasks);
+    defer ca.free(tasks);
+    for (0..rounds) |_| {
+        for (tasks, 0..) |*t, i| t.* = make(i, out);
+        if (@TypeOf(pool) == void)
+            try sm.runParallel(T, tasks, .{ .threads = threads, .chunk = 256 })
+        else
+            try pool.run(T, tasks, .{ .chunk = 256 });
+        if (gap and builtin.os.tag != .windows) _ = c_usleep(100);
     }
-};
+}
+
+fn dispatchHandle(out: *std.atomic.Value(u64), msg: u64) void {
+    _ = out.fetchAdd(sliceWork(msg) & 0xff, .monotonic);
+}
+
+const BigMsg = [32]u64;
+fn dispatchHandleBig(out: *std.atomic.Value(u64), msg: BigMsg) void {
+    _ = out.fetchAdd(sliceWork(msg[0] +% msg[31]) & 0xff, .monotonic);
+}
 
 fn ioTask(out: *std.atomic.Value(u64), id: usize) Io.Cancelable!void {
     _ = out.fetchAdd(taskSequential(id), .monotonic);
@@ -324,14 +356,80 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         r.children = usage(true);
         r.children.maxrss_kb = rss_sum;
+    } else if (std.mem.startsWith(u8, name, "sm-repeat")) {
+        // Back-to-back parallel runs of N tasks (per-run overhead), with `Pool`
+        // when the library has it, else `runParallel` per run.
+        // sm-repeat: small even tasks; -skew: every 97th task 64x longer;
+        // -big: 504-byte tasks, uneven rounds; -long: 16x longer tasks;
+        // -gap: 100 us idle between runs (an app that is mostly idle).
+        const shape = name["sm-repeat".len..];
+        const gap = std.mem.eql(u8, shape, "-gap");
+        const long = std.mem.eql(u8, shape, "-long");
+        var rounds: usize = std.math.clamp(2_000_000 / n_tasks, 4, 500);
+        if (long) rounds = @max(4, rounds / 16);
+        if (gap) rounds = @min(rounds, 200);
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const use_pool = @hasDecl(sm, "Pool");
+        var pool: if (use_pool) sm.Pool else void = undefined;
+        if (use_pool) pool.init(io, .{ .threads = r.threads });
+        if (std.mem.eql(u8, shape, "-skew")) {
+            try repeatRuns(SkewTask, io, ca, &out, if (use_pool) &pool else {}, r.threads, rounds, false, struct {
+                fn f(i: usize, o: *std.atomic.Value(u64)) SkewTask {
+                    return .{ .acc = i, .left = if (i % 97 == 0) slices * 64 else slices, .out = o };
+                }
+            }.f);
+        } else if (std.mem.eql(u8, shape, "-big")) {
+            try repeatRuns(BigTask, io, ca, &out, if (use_pool) &pool else {}, r.threads, rounds, false, struct {
+                fn f(i: usize, o: *std.atomic.Value(u64)) BigTask {
+                    return .{ .acc = i, .left = @intCast(1 + i % (2 * slices)), .out = o };
+                }
+            }.f);
+        } else if (long) {
+            try repeatRuns(SkewTask, io, ca, &out, if (use_pool) &pool else {}, r.threads, rounds, false, struct {
+                fn f(i: usize, o: *std.atomic.Value(u64)) SkewTask {
+                    return .{ .acc = i, .left = slices * 16, .out = o };
+                }
+            }.f);
+        } else if (gap or shape.len == 0) {
+            try repeatRuns(SmTask, io, ca, &out, if (use_pool) &pool else {}, r.threads, rounds, gap, struct {
+                fn f(i: usize, o: *std.atomic.Value(u64)) SmTask {
+                    return .{ .acc = i, .out = o };
+                }
+            }.f);
+        } else return error.UnknownVariant;
+        if (use_pool) pool.deinit();
+        r.ns = now(io) - t0;
+        r.ops = n_tasks * rounds;
+        r.check = out.load(.monotonic);
+    } else if (std.mem.eql(u8, name, "sm-skew")) {
+        // Uneven work: every 97th task runs 64x longer than the rest.
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const tasks = try ca.alloc(SkewTask, n_tasks);
+        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = if (i % 97 == 0) slices * 64 else slices, .out = &out };
+        try sm.runParallel(SkewTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        r.ns = now(io) - t0;
+        ca.free(tasks);
+        r.check = out.load(.monotonic);
+    } else if (std.mem.eql(u8, name, "sm-big")) {
+        // 504-byte tasks finishing at different rounds.
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const tasks = try ca.alloc(BigTask, n_tasks);
+        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = @intCast(1 + i % (2 * slices)), .out = &out };
+        try sm.runParallel(BigTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        r.ns = now(io) - t0;
+        ca.free(tasks);
+        r.check = out.load(.monotonic);
     } else if (std.mem.eql(u8, name, "io-dispatch")) {
-        // 10 * N messages through a Dispatcher with one worker per CPU.
+        // N messages through a Dispatcher with one worker per CPU.
         // Uses `submitMany` (batches of 64) when the library has it.
         var threaded: Io.Threaded = .init(ca, .{});
         defer threaded.deinit();
         const tio = threaded.io();
         r.threads = cpuCount();
-        const msgs = n_tasks * 10;
+        const msgs = n_tasks;
         const D = coro.io.Dispatcher(u64, *std.atomic.Value(u64), dispatchHandle);
         var qbuf: [256]u64 = undefined;
         const t0 = now(io);
@@ -350,25 +448,33 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         try d.shutdown();
         r.ns = now(io) - t0;
         r.ops = msgs;
-    } else if (std.mem.eql(u8, name, "sm-big")) {
-        // 504-byte tasks finishing at different rounds.
-        r.threads = cpuCount();
-        const t0 = now(io);
-        const tasks = try ca.alloc(BigTask, n_tasks);
-        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = @intCast(1 + i % (2 * slices)), .out = &out };
-        try sm.runParallel(BigTask, tasks, .{ .threads = r.threads, .chunk = 256 });
-        r.ns = now(io) - t0;
-        ca.free(tasks);
         r.check = out.load(.monotonic);
-    } else if (std.mem.eql(u8, name, "sm-skew")) {
-        // Uneven work: every 97th task runs 64x longer than the rest.
+    } else if (std.mem.eql(u8, name, "io-dispatch-big")) {
+        // N 256-byte messages through a Dispatcher with one worker per CPU.
+        // Uses `submitMany` (batches of 64) when the library has it.
+        var threaded: Io.Threaded = .init(ca, .{});
+        defer threaded.deinit();
+        const tio = threaded.io();
         r.threads = cpuCount();
+        const msgs = n_tasks;
+        const D = coro.io.Dispatcher(BigMsg, *std.atomic.Value(u64), dispatchHandleBig);
+        var qbuf: [256]BigMsg = undefined;
         const t0 = now(io);
-        const tasks = try ca.alloc(SkewTask, n_tasks);
-        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = if (i % 97 == 0) slices * 64 else slices, .out = &out };
-        try sm.runParallel(SkewTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        var d: D = .init(tio, &out, &qbuf);
+        try d.start(r.threads);
+        if (@hasDecl(D, "submitMany")) {
+            var batch: [64]BigMsg = undefined;
+            var i: usize = 0;
+            while (i < msgs) {
+                const k = @min(batch.len, msgs - i);
+                for (batch[0..k], 0..) |*m, j| m.* = @splat(i + j);
+                try d.submitMany(batch[0..k]);
+                i += k;
+            }
+        } else for (0..msgs) |i| try d.submit(@as(BigMsg, @splat(i)));
+        try d.shutdown();
         r.ns = now(io) - t0;
-        ca.free(tasks);
+        r.ops = msgs;
         r.check = out.load(.monotonic);
     } else {
         return error.UnknownVariant;
@@ -385,10 +491,11 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
 
 fn emit(w: *Io.Writer, r: Result) !void {
     try w.print("{s} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d}\n", .{
-        r.name,             r.ops,            r.ns,             r.allocs,         r.alloc_bytes,
-        r.threads,          r.procs,          r.spawn_ns,       r.check,          r.self.maxrss_kb,
-        r.self.minflt,      r.self.majflt,    r.self.nvcsw,     r.self.nivcsw,    r.children.maxrss_kb,
-        r.children.minflt,  r.children.nvcsw, r.children.nivcsw,  r.self.cpu_us,     r.children.cpu_us, r.wall_all_ns,
+        r.name,            r.ops,            r.ns,              r.allocs,      r.alloc_bytes,
+        r.threads,         r.procs,          r.spawn_ns,        r.check,       r.self.maxrss_kb,
+        r.self.minflt,     r.self.majflt,    r.self.nvcsw,      r.self.nivcsw, r.children.maxrss_kb,
+        r.children.minflt, r.children.nvcsw, r.children.nivcsw, r.self.cpu_us, r.children.cpu_us,
+        r.wall_all_ns,
     });
 }
 
@@ -404,8 +511,16 @@ fn parse(line: []const u8, name_buf: []u8) !Result {
         }
     }.f;
     return .{
-        .name = name_buf[0..name.len], .ops = u(v[0]), .ns = @intCast(v[1]), .allocs = u(v[2]), .alloc_bytes = u(v[3]),
-        .wall_all_ns = @intCast(v[19]), .threads = @intCast(v[4]), .procs = @intCast(v[5]), .spawn_ns = @intCast(v[6]), .check = u(v[7]),
+        .name = name_buf[0..name.len],
+        .ops = u(v[0]),
+        .ns = @intCast(v[1]),
+        .allocs = u(v[2]),
+        .alloc_bytes = u(v[3]),
+        .wall_all_ns = @intCast(v[19]),
+        .threads = @intCast(v[4]),
+        .procs = @intCast(v[5]),
+        .spawn_ns = @intCast(v[6]),
+        .check = u(v[7]),
         .self = .{ .maxrss_kb = u(v[8]), .minflt = u(v[9]), .majflt = u(v[10]), .nvcsw = u(v[11]), .nivcsw = u(v[12]), .cpu_us = u(v[17]) },
         .children = .{ .maxrss_kb = u(v[13]), .minflt = u(v[14]), .nvcsw = u(v[15]), .nivcsw = u(v[16]), .cpu_us = u(v[18]) },
     };
@@ -560,3 +675,6 @@ fn row(w: *Io.Writer, r: Result) !void {
         r.children.minflt, r.children.nvcsw,     r.children.nivcsw,
     });
 }
+
+extern "c" fn usleep(us: c_uint) c_int;
+const c_usleep = usleep;

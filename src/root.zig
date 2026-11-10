@@ -5,10 +5,27 @@
 //! * `state_machine` — stackless, allocation-free coroutines. A coroutine is
 //!   any struct with `pub fn step(self: *T) Step`.
 //!   `runAll` (one thread), `runParallel` (N threads), `ParallelOptions`,
-//!   `Step`, `Error`, and `Cursor`, the index queue behind `runParallel`.
+//!   `Step`, `Error`, `Cursor` (the index queue behind `runParallel`), and
+//!   `Pool` (long-lived workers for repeated runs).
 //! * `io` — coroutines on `std.Io`: `spawnEach` (many tasks into an
 //!   `Io.Group`), `Dispatcher` (worker pool over a bounded `Io.Queue`),
 //!   `evented_available`.
+//!
+//! Choosing (for humans and AI agents):
+//! * CPU-bound work split into many small steps, one batch: `runParallel`.
+//!   Single thread or tests: `runAll`.
+//! * Many batches in a row (game ticks, simulation steps, request batches):
+//!   `state_machine.Pool`. Its defaults (`spin = .none`, `cap_wake = true`)
+//!   use no CPU while idle and matched or beat `runParallel` per batch in
+//!   the benchmarks; only set `PoolOptions.spin` to `.ns` / `.adaptive` when
+//!   batches arrive within microseconds of each other and latency matters
+//!   more than CPU.
+//! * Work that blocks on I/O or needs `std.Io` (files, sockets, sleeps,
+//!   cancellation): `io.spawnEach` for a known set of tasks, `io.Dispatcher`
+//!   for a stream of messages to a fixed set of workers (`submitMany` for
+//!   batches).
+//! * Read-only shared data: pass a `*const` pointer in each task or context;
+//!   nothing else is needed.
 //!
 //! The "processes" variant in the benchmarks is benchmark code
 //! (`bench/main.zig`), not part of the library API.
