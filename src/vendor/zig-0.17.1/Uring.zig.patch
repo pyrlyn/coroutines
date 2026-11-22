@@ -1,5 +1,5 @@
---- lib/std/Io/Uring.zig	2026-11-02 23:41:32
-+++ b/Uring.zig	2026-11-10 07:22:07
+--- lib/std/Io/Uring.zig
++++ b/Uring.zig
 @@ -39,7 +39,7 @@
  const splat_buffer_size = Io.Threaded.splat_buffer_size;
  const statFromLinux = Io.Threaded.statFromLinux;
@@ -9,7 +9,34 @@
  const timestampFromPosix = Io.Threaded.timestampFromPosix;
  const unexpectedErrno = std.posix.unexpectedErrno;
  const winsize = std.posix.winsize;
-@@ -2402,10 +2402,6 @@
+@@ -1572,6 +1572,26 @@
+ 
+     fn lock(group: Group, ev: *Evented) void {
+         const mutex = group.mutexPtr();
++        // coroutines patch: `SwitchMessage.handle` runs `.group_await` /
++        // `.group_cancel` right after a context switch, which may land on
++        // the thread's idle context. There is no fiber to suspend there, so
++        // a contended lock must not wait on the futex (that asserts in
++        // `currentFiber`). The lock is held only for a few list operations
++        // by fibers on other threads: spin until it is free.
++        const thread: *Thread = .current();
++        if (thread.current_context == &thread.idle_context) {
++            while (true) {
++                const old_state = @atomicRmw(
++                    Mutex,
++                    mutex,
++                    .Or,
++                    .{ .locked = true, .contended = false, .shared2 = 0 },
++                    .acquire,
++                );
++                if (!old_state.locked) return;
++                std.atomic.spinLoopHint();
++            }
++        }
+         {
+             const old_state = @atomicRmw(
+                 Mutex,
+@@ -2402,10 +2422,6 @@
                  return error.ConcurrencyUnavailable
              else
                  .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
@@ -20,7 +47,7 @@
              .net_receive => |o| {
                  _ = o;
                  @panic("TODO implement batchDrainSubmitted for net_receive");
-@@ -2525,7 +2521,6 @@
+@@ -2525,7 +2541,6 @@
                      },
                  },
                  .device_io_control => unreachable,

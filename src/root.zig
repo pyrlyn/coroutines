@@ -23,11 +23,14 @@ pub const io = @import("io.zig");
 /// Evented runtime: fibers on io_uring / libdispatch, structured scopes,
 /// bounded channels and a concurrency limiter.
 pub const evented = @import("evented.zig");
+/// Own work-stealing runtime for stackless tasks that wait without a thread.
+pub const rt = @import("rt.zig");
 
 test {
     _ = state_machine;
     _ = io;
     _ = evented;
+    _ = rt;
 }
 
 // Keeps the examples in README.md / docs/API.md compiling.

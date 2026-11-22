@@ -1572,6 +1572,26 @@ const Group = struct {
 
     fn lock(group: Group, ev: *Evented) void {
         const mutex = group.mutexPtr();
+        // coroutines patch: `SwitchMessage.handle` runs `.group_await` /
+        // `.group_cancel` right after a context switch, which may land on
+        // the thread's idle context. There is no fiber to suspend there, so
+        // a contended lock must not wait on the futex (that asserts in
+        // `currentFiber`). The lock is held only for a few list operations
+        // by fibers on other threads: spin until it is free.
+        const thread: *Thread = .current();
+        if (thread.current_context == &thread.idle_context) {
+            while (true) {
+                const old_state = @atomicRmw(
+                    Mutex,
+                    mutex,
+                    .Or,
+                    .{ .locked = true, .contended = false, .shared2 = 0 },
+                    .acquire,
+                );
+                if (!old_state.locked) return;
+                std.atomic.spinLoopHint();
+            }
+        }
         {
             const old_state = @atomicRmw(
                 Mutex,
