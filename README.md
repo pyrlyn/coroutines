@@ -1,15 +1,16 @@
 # coroutines
 
-Two coroutine flavours for Zig 0.17.0, standard library only (no third-party dependencies).
+Two coroutine flavours for Zig 0.17.1, plus an evented runtime. Standard library only, no third-party dependencies; `src/vendor/` holds patched copies of two std files.
 
 | module | what a coroutine is | switch | memory per task | parallelism |
 |---|---|---|---|---|
 | `coroutines.state_machine` | a struct with a state field and `pub fn step(*T) Step` (`.yield` / `.done`) | a function return + call | `@sizeOf(T)`, caller-provided storage, 0 allocations | `runParallel`: N OS threads, lock-free chunked work queue |
 | `coroutines.io` | a function run through `std.Io` (`Io.Group`, `Io.Queue`) | whatever the `Io` does (thread handoff for `std.Io.Threaded`) | one allocation per task in `std.Io.Threaded` (64 B measured) | the `Io` thread pool |
+| `coroutines.rt` | a struct with `Output` and `pub fn poll(*T, *rt.Context) rt.Poll(Output)`; waits (join, channel, semaphore) without a thread | a function return + call; wake-ups go to the worker's LIFO slot | one pooled 64 B+ frame, 0 allocations in steady state | own work-stealing pool (see [docs/rt.md](docs/rt.md)) |
 
 ## Using in your project
 
-Requires Zig 0.17.0. No dependencies besides the standard library.
+Requires Zig 0.17.1. No dependencies besides the standard library.
 
 1. Add the package:
 
@@ -94,6 +95,42 @@ Full reference: [docs/API.md](docs/API.md).
   the queue and waits until it is drained; `cancel` stops workers at their next
   cancellation point.
 
+### `evented`
+
+A separate layer whose runtime owns an evented `std.Io` (fibers): io_uring on Linux, libdispatch on macOS.
+A task blocked in `await`, a channel, the limiter or `sleep` suspends its fiber, not an OS thread.
+
+```zig
+const ev = coro.evented;
+var rt: ev.Runtime = undefined;
+try rt.init(gpa, .{}); // gpa must be thread-safe
+defer rt.deinit();
+const io = rt.io();
+
+var f = try rt.spawn(work, .{ io, 1 }); // Io.Future
+_ = f.await(io);
+
+var scope: ev.Scope = .init(io); // structured: first error cancels the rest
+try scope.spawn(fetch, .{ io, "a" });
+try scope.spawn(fetch, .{ io, "b" });
+try scope.join();
+
+var buf: [64]u32 = undefined;
+var ch: ev.Channel(u32) = .init(&buf); // bounded: send suspends while full
+var permits: [8]u8 = undefined;
+var limit: ev.Limiter = .init(io, &permits); // at most 8 holders, FIFO
+```
+
+`Scope`, `Channel` and `Limiter` only need an `Io`, so they also work on `std.Io.Threaded`.
+Caveats with Zig 0.17.1 (details in `src/vendor/zig-0.17.1/README.md`):
+* `std.Io.Evented` does not compile upstream. `evented` therefore uses patched copies of
+  `Io/Uring.zig` and `Io/Dispatch.zig`; the patches only remove stale `net_accept` prongs.
+* Upstream fiber switching misbehaves in optimized builds: a single spawn plus await aborts or returns
+  garbage. `evented.available` is therefore false outside Debug, unless the root file sets
+  `pub const coroutines_evented_allow_optimized = true`.
+* On libdispatch, canceling a fiber that is in `sleep` or blocked on a contended queue is
+  broken upstream. The tests that need it are skipped on macOS.
+
 ## Tests
 
 `zig build test` — 9 unit tests:
@@ -106,7 +143,7 @@ Full reference: [docs/API.md](docs/API.md).
 
 ## Benchmarks
 
-`zig build bench` (always ReleaseFast) or `bench/run.sh` (suites: `switch`, `spawn`, `procs`, `sweep`; select with `SUITES=...`) to write one file per suite into
+`zig build bench` (ReleaseFast; `-Dbench-optimize=Debug` for a Debug binary) or `bench/run.sh` (suites: `switch`, `spawn`, `procs`, `sweep`, `evented`; select with `SUITES=...`) to write one file per suite into
 [`bench/results/`](bench/results) with machine, OS, CPU, Zig version and date.
 Every variant runs in a fresh process (median of 5), so RSS, page faults and context
 switches belong to that variant only. Workload: 10,000 tasks, each 4 slices of 256

@@ -1,5 +1,5 @@
 //! Benchmarks: `zig build bench` (ReleaseFast) or `zig-out/bin/bench [suite]`.
-//! Suites: switch, spawn, procs, all (default). Every measured variant runs in
+//! Suites: switch, spawn, procs, evented, all (default). Every measured variant runs in
 //! its own child process (`bench variant <name>`), so peak RSS, page faults and
 //! context switches are attributed to that variant only.
 const std = @import("std");
@@ -9,6 +9,12 @@ const sm = coro.state_machine;
 const Io = std.Io;
 
 const is_windows = builtin.os.tag == .windows;
+
+/// Lets `coroutines.evented` run in this ReleaseFast binary despite the
+/// upstream fiber bug in optimized builds (see `evented.allow_optimized`).
+/// A crashing `ev-*` variant is reported as failed, not hidden.
+pub const coroutines_evented_allow_optimized = true;
+const ev = coro.evented;
 
 // ------------------------------------------------------------ workload
 
@@ -38,6 +44,43 @@ const SmTask = struct {
     left: u8 = slices,
     out: *std.atomic.Value(u64),
     pub fn step(t: *SmTask) sm.Step {
+        t.acc = sliceWork(t.acc);
+        t.left -= 1;
+        if (t.left == 0) {
+            _ = t.out.fetchAdd(t.acc, .monotonic);
+            return .done;
+        }
+        return .yield;
+    }
+};
+
+fn dispatchHandle(out: *std.atomic.Value(u64), msg: u64) void {
+    _ = out.fetchAdd(sliceWork(msg) & 0xff, .monotonic);
+}
+
+/// `SmTask` with a 480-byte payload (sm-big): moving a task costs.
+const BigTask = struct {
+    acc: u64,
+    left: u8,
+    out: *std.atomic.Value(u64),
+    payload: [480]u8 = undefined,
+    pub fn step(t: *BigTask) sm.Step {
+        t.acc = sliceWork(t.acc);
+        t.left -= 1;
+        if (t.left == 0) {
+            _ = t.out.fetchAdd(t.acc, .monotonic);
+            return .done;
+        }
+        return .yield;
+    }
+};
+
+/// Like `SmTask`, but `left` fits long tasks (sm-skew).
+const SkewTask = struct {
+    acc: u64,
+    left: u16,
+    out: *std.atomic.Value(u64),
+    pub fn step(t: *SkewTask) sm.Step {
         t.acc = sliceWork(t.acc);
         t.left -= 1;
         if (t.left == 0) {
@@ -177,6 +220,10 @@ fn pong(io: Io, a: *Io.Queue(u32), b: *Io.Queue(u32), n: usize) Io.Cancelable!vo
     }
 }
 
+fn evPong(io: Io, a: *ev.Channel(u32), b: *ev.Channel(u32), n: usize) ev.Channel(u32).Error!void {
+    for (0..n) |_| try b.send(io, (try a.recv(io)) + 1);
+}
+
 fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const u8) !Result {
     const io = init.io;
     var counting: Counting = .{ .child = std.heap.page_allocator };
@@ -305,6 +352,116 @@ fn runVariant(init: std.process.Init, name: []const u8, extra: []const [:0]const
         r.ns = now(io) - t0;
         ca.free(tasks);
         r.ops = n_tasks * rounds;
+    } else if (std.mem.eql(u8, name, "io-dispatch")) {
+        // 10 * N messages through a Dispatcher with one worker per CPU.
+        // Uses `submitMany` (batches of 64) when the library has it.
+        var threaded: Io.Threaded = .init(ca, .{});
+        defer threaded.deinit();
+        const tio = threaded.io();
+        r.threads = cpuCount();
+        const msgs = n_tasks * 10;
+        const D = coro.io.Dispatcher(u64, *std.atomic.Value(u64), dispatchHandle);
+        var qbuf: [256]u64 = undefined;
+        const t0 = now(io);
+        var d: D = .init(tio, &out, &qbuf);
+        try d.start(r.threads);
+        if (@hasDecl(D, "submitMany")) {
+            var batch: [64]u64 = undefined;
+            var i: usize = 0;
+            while (i < msgs) {
+                const k = @min(batch.len, msgs - i);
+                for (batch[0..k], 0..) |*m, j| m.* = i + j;
+                try d.submitMany(batch[0..k]);
+                i += k;
+            }
+        } else for (0..msgs) |i| try d.submit(i);
+        try d.shutdown();
+        r.ns = now(io) - t0;
+        r.ops = msgs;
+    } else if (std.mem.eql(u8, name, "ev-switch")) {
+        // Same ping-pong as io-switch, on the evented runtime: each handoff
+        // suspends one fiber and resumes the other.
+        if (!ev.available) return error.EventedUnavailable;
+        var rt: ev.Runtime = undefined;
+        try rt.init(ca, .{});
+        defer rt.deinit();
+        const eio = rt.io();
+        var ba: [1]u32 = undefined;
+        var bb: [1]u32 = undefined;
+        var qa: ev.Channel(u32) = .init(&ba);
+        var qb: ev.Channel(u32) = .init(&bb);
+        const a0 = counting.allocs.load(.monotonic);
+        const t0 = now(io);
+        var f = try rt.spawn(evPong, .{ eio, &qa, &qb, handoffs });
+        var v: u32 = 0;
+        for (0..handoffs) |_| {
+            try qa.send(eio, v);
+            v = try qb.recv(eio);
+        }
+        try f.await(eio);
+        r.ns = now(io) - t0;
+        r.ops = handoffs * 2;
+        r.allocs = counting.allocs.load(.monotonic) - a0;
+        r.threads = 2;
+        r.check = v;
+    } else if (std.mem.eql(u8, name, "ev-group")) {
+        // io-group (spawnEach + Group.await) on the evented runtime.
+        if (!ev.available) return error.EventedUnavailable;
+        var rt: ev.Runtime = undefined;
+        try rt.init(ca, .{});
+        defer rt.deinit();
+        const eio = rt.io();
+        r.threads = cpuCount();
+        const t0 = now(io);
+        var g: Io.Group = .init;
+        coro.io.spawnEach(eio, &g, n_tasks, ioTask, &out);
+        try g.await(eio);
+        r.ns = now(io) - t0;
+        r.check = out.load(.monotonic);
+    } else if (std.mem.eql(u8, name, "ev-dispatch")) {
+        // io-dispatch on the evented runtime.
+        if (!ev.available) return error.EventedUnavailable;
+        var rt: ev.Runtime = undefined;
+        try rt.init(ca, .{});
+        defer rt.deinit();
+        const eio = rt.io();
+        r.threads = cpuCount();
+        const msgs = n_tasks * 10;
+        const D = coro.io.Dispatcher(u64, *std.atomic.Value(u64), dispatchHandle);
+        var qbuf: [256]u64 = undefined;
+        const t0 = now(io);
+        var d: D = .init(eio, &out, &qbuf);
+        try d.start(r.threads);
+        var batch: [64]u64 = undefined;
+        var i: usize = 0;
+        while (i < msgs) {
+            const k = @min(batch.len, msgs - i);
+            for (batch[0..k], 0..) |*m, j| m.* = i + j;
+            try d.submitMany(batch[0..k]);
+            i += k;
+        }
+        try d.shutdown();
+        r.ns = now(io) - t0;
+        r.ops = msgs;
+    } else if (std.mem.eql(u8, name, "sm-big")) {
+        // 504-byte tasks finishing at different rounds.
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const tasks = try ca.alloc(BigTask, n_tasks);
+        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = @intCast(1 + i % (2 * slices)), .out = &out };
+        try sm.runParallel(BigTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        r.ns = now(io) - t0;
+        ca.free(tasks);
+        r.check = out.load(.monotonic);
+    } else if (std.mem.eql(u8, name, "sm-skew")) {
+        // Uneven work: every 97th task runs 64x longer than the rest.
+        r.threads = cpuCount();
+        const t0 = now(io);
+        const tasks = try ca.alloc(SkewTask, n_tasks);
+        for (tasks, 0..) |*t, i| t.* = .{ .acc = i, .left = if (i % 97 == 0) slices * 64 else slices, .out = &out };
+        try sm.runParallel(SkewTask, tasks, .{ .threads = r.threads, .chunk = 256 });
+        r.ns = now(io) - t0;
+        ca.free(tasks);
         r.check = out.load(.monotonic);
     } else {
         return error.UnknownVariant;
@@ -353,6 +510,7 @@ const Suite = struct { name: []const u8, title: []const u8, variants: []const []
 const suites = [_]Suite{
     .{ .name = "switch", .title = "Switch cost", .variants = &.{ "sm-switch", "io-switch" } },
     .{ .name = "spawn", .title = "Spawn and run 10,000 small tasks", .variants = &.{ "sm-1thread", "sm-parallel", "io-group" } },
+    .{ .name = "evented", .title = "std.Io.Threaded vs evented runtime (coroutines.evented)", .variants = &.{ "io-switch", "ev-switch", "io-group", "ev-group", "io-dispatch", "ev-dispatch" } },
     .{ .name = "procs", .title = "Processes vs coroutines, same 10,000-task workload", .variants = &.{ "sequential", "procs2", "sm-1thread", "sm-parallel", "io-group" } },
 };
 

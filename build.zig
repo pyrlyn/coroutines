@@ -14,20 +14,38 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
-    // Benchmarks are always ReleaseFast.
+    // Benchmarks are ReleaseFast unless -Dbench-optimize says otherwise.
+    const bench_optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "Optimization mode of the bench binary (default ReleaseFast)") orelse std.builtin.OptimizeMode.ReleaseFast;
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
         .link_libc = target.result.os.tag != .windows,
     });
     bench_mod.addImport("coroutines", b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = bench_optimize,
     }));
     const bench_exe = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
     b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
     b.step("bench", "Run benchmarks (ReleaseFast)").dependOn(&run_bench.step);
+
+    // `rt` runtime benchmarks (same workloads as the tokio / Go programs).
+    const bench_rt_mod = b.createModule(.{
+        .root_source_file = b.path("bench/rt.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = target.result.os.tag != .windows,
+    });
+    bench_rt_mod.addImport("coroutines", b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    const bench_rt_exe = b.addExecutable(.{ .name = "bench-rt", .root_module = bench_rt_mod });
+    b.installArtifact(bench_rt_exe);
+    const run_bench_rt = b.addRunArtifact(bench_rt_exe);
+    b.step("bench-rt", "Run rt benchmarks (ReleaseFast)").dependOn(&run_bench_rt.step);
 }

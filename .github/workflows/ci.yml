@@ -55,3 +55,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
+
+  evented:
+    name: evented (${{ matrix.os }})
+    needs: linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # io_uring on Linux, libdispatch on macOS.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - run: zig version
+      - name: Evented runtime tests (Debug; optimized builds hit an upstream fiber bug)
+        run: zig test src/root.zig --test-filter evented 2>&1 | tee evented.log; test "${PIPESTATUS[0]}" -eq 0
+        shell: bash
+      - name: Fail if the evented tests were all skipped
+        shell: bash
+        run: |
+          if grep -q "evented.test.Runtime: spawn and await...SKIP" evented.log; then
+            echo "evented backend unavailable on this runner"; exit 1
+          fi

@@ -1,0 +1,18 @@
+--- lib/std/Io/Dispatch.zig	2026-11-02 23:41:32
++++ b/Dispatch.zig	2026-11-10 07:22:07
+@@ -2134,7 +2134,6 @@
+                     break :result null;
+                 },
+                 .device_io_control => {},
+-                .net_accept => @panic("TODO implement batched net_accept"),
+                 .net_receive => @panic("TODO implement batched net_receive"),
+                 .net_send => @panic("TODO implement batched net_send"),
+                 .net_read => @panic("TODO implement batched net_read"),
+@@ -2197,7 +2196,6 @@
+             } };
+         },
+         .device_io_control => unreachable,
+-        .net_accept => @panic("TODO implement batched net_accept"),
+         .net_receive => @panic("TODO implement batched net_receive"),
+         .net_send => @panic("TODO implement batched net_send"),
+         .net_read => @panic("TODO implement batched net_read"),

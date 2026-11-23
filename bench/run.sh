@@ -32,7 +32,7 @@ for suite in ${SUITES:-switch spawn procs sweep bytasks}; do
     echo "- Machine: ${MACHINE:-$(hostname -s)}"
     echo "- OS: $os"
     echo "- CPU: $cpu, $ncpu logical CPUs"
-    echo "- Zig: $zigv, ReleaseFast"
+    echo "- Zig: $zigv, ${BENCH_MODE:-ReleaseFast}"
     echo "- Available RAM at start: $avail MB"
     echo
     nice -n 10 "$bin" "$suite"
