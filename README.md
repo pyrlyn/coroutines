@@ -1,4 +1,4 @@
-# coroutines
+<h1><picture><source media="(prefers-color-scheme: dark)" srcset="brand/logo-dark.svg"><img src="brand/logo.svg" width="32" height="32" alt="" align="absmiddle"></picture> coroutines</h1>
 
 Two coroutine flavours for Zig 0.17.1, plus an evented runtime. Standard library only, no third-party dependencies; `src/vendor/` holds patched copies of two std files.
 
